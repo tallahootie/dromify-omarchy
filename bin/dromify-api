@@ -1,0 +1,451 @@
+#!/bin/bash
+# dromify-api - Subsonic/Navidrome REST client used by Dromify, the
+# Omarchy plugin. Talks the same salt+token auth scheme as Dromify's
+# NavidromeClient (Subsonic API 1.16.1, JSON responses): t = md5(password + salt).
+#
+# Supports multiple named server profiles. Config lives in
+# ~/.config/omarchy/dromify/config.json:
+#   { "activeProfileId": "...", "profiles": [{id, name, serverURL, username}, ...] }
+# Passwords are kept out of that file entirely and stored one per profile id
+# in the desktop keyring via secret-tool (libsecret), matching the app's use
+# of the system Keychain rather than a plaintext blob.
+#
+# The password for configure/relogin is read from stdin (one line), never
+# taken as an argument -- argv is world-readable via /proc, so a secret
+# must never appear there.
+#
+# Usage:
+#   dromify-api configure <name> <serverURL> <username>   # password on stdin
+#                                               -> adds a profile, makes it active
+#   dromify-api relogin <profileId>                       # password on stdin
+#                                               -> re-signs a logged-out profile in
+#   dromify-api status       -> {"configured":bool,"active":{id,name,serverURL,username}|null,"profiles":[...]}
+#   dromify-api switch <id>  -> makes an existing profile active
+#   dromify-api forget <id>  -> removes one profile (and its stored password)
+#   dromify-api ping
+#   dromify-api get <endpoint> [key=value ...]   -> unwrapped subsonic-response JSON on stdout
+#   dromify-api url <endpoint> [key=value ...]   -> a fully-authed URL on stdout (no request made)
+#   dromify-api urls <endpoint> <id1> [id2 ...]  -> one fully-authed URL per line
+#   dromify-api copy-password [profileId]  -> puts that profile's password (the
+#                                   active one if no id) on the Wayland
+#                                   clipboard via wl-copy --sensitive, so
+#                                   Omarchy's clipboard history skips it
+
+set -uo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/dromify"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+SECRET_SERVICE="omarchy-dromify"
+CLIENT_NAME="Dromify"
+API_VERSION="1.16.1"
+
+# The plugin used to be called "Dromarchy" (before it took the Dromify
+# name to match the iOS app) - these are where its config/keyring entries
+# lived, so a rename doesn't force everyone to reconfigure their server.
+OLD_CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/dromarchy/config.json"
+OLD_SECRET_SERVICE="omarchy-dromarchy"
+
+fail() { echo "dromify-api: $*" >&2; exit 1; }
+
+need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found on PATH"; }
+
+need jq
+need curl
+need md5sum
+
+urlencode() { jq -rn --arg v "${1:-}" '$v|@uri'; }
+
+new_id() { (date +%s%N; echo "$RANDOM"; hostname) 2>/dev/null | md5sum | cut -c1-12; }
+
+# Reads one line (the password) from stdin. configure/relogin take the
+# secret this way rather than as $4/$2 so it never lands in argv, which any
+# process on the machine can read out of /proc/<pid>/cmdline. A trailing
+# newline from `echo`/here-strings is stripped; the password itself may
+# contain spaces but not a literal newline.
+read_secret_stdin() {
+  local s
+  IFS= read -r s || true
+  printf '%s' "$s"
+}
+
+# --- config storage ----------------------------------------------------------
+
+# One-time move from the old "Dromarchy"-branded config dir/keyring service
+# to today's "Dromify" ones (see OLD_CONFIG_FILE/OLD_SECRET_SERVICE above).
+# Copies config.json over as-is and re-stores each profile's password under
+# the new secret-tool service, so the plugin rename doesn't strand anyone's
+# already-configured server. No-op once $CONFIG_FILE exists.
+migrate_from_dromarchy() {
+  [[ -f "$CONFIG_FILE" ]] && return 0
+  [[ -f "$OLD_CONFIG_FILE" ]] || return 0
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  cp "$OLD_CONFIG_FILE" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+
+  local p id name server username password
+  while IFS= read -r p; do
+    id=$(jq -r '.id' <<<"$p")
+    name=$(jq -r '.name' <<<"$p")
+    server=$(jq -r '.serverURL' <<<"$p")
+    username=$(jq -r '.username' <<<"$p")
+    password=$(secret-tool lookup service "$OLD_SECRET_SERVICE" profile "$id" 2>/dev/null)
+    [[ -n "$password" ]] || continue
+    secret-tool store --label="Dromify: $name ($username@$server)" \
+      service "$SECRET_SERVICE" profile "$id" <<<"$password" 2>/dev/null
+    secret-tool clear service "$OLD_SECRET_SERVICE" profile "$id" >/dev/null 2>&1
+  done < <(jq -c '(.profiles // [])[]' <<<"$(cat "$CONFIG_FILE")" 2>/dev/null)
+}
+
+# One-time upgrade from the pre-multi-profile config shape
+# ({serverURL, username}, password keyed by server+username) to the current
+# one. Runs on every invocation but is a no-op once migrated — cheap, and
+# means an existing connection just keeps working as "Server" after an
+# update instead of silently looking disconnected.
+migrate_legacy_config() {
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  local raw has_profiles legacy_url legacy_user
+  raw=$(cat "$CONFIG_FILE")
+  has_profiles=$(jq -r 'has("profiles")' <<<"$raw" 2>/dev/null)
+  [[ "$has_profiles" == "true" ]] && return 0
+  legacy_url=$(jq -r '.serverURL // empty' <<<"$raw" 2>/dev/null)
+  legacy_user=$(jq -r '.username // empty' <<<"$raw" 2>/dev/null)
+  [[ -n "$legacy_url" && -n "$legacy_user" ]] || return 0
+  local legacy_password
+  legacy_password=$(secret-tool lookup service "$SECRET_SERVICE" server "$legacy_url" username "$legacy_user" 2>/dev/null)
+  [[ -n "$legacy_password" ]] || return 0
+
+  local id host
+  id=$(new_id)
+  host=$(printf '%s' "$legacy_url" | sed -E 's#^[a-z]+://##; s#/.*##')
+  write_config < <(jq -n --arg id "$id" --arg name "$host" --arg u "$legacy_url" --arg n "$legacy_user" \
+    '{activeProfileId: $id, profiles: [{id: $id, name: $name, serverURL: $u, username: $n}]}')
+  secret-tool store --label="Dromify: $host ($legacy_user@$legacy_url)" \
+    service "$SECRET_SERVICE" profile "$id" <<<"$legacy_password"
+  secret-tool clear service "$SECRET_SERVICE" server "$legacy_url" username "$legacy_user" >/dev/null 2>&1
+}
+
+# Prints the raw config JSON, or "{}" if there's no config file yet (a fresh
+# install, or one that's had every profile forgotten).
+read_config() {
+  migrate_from_dromarchy
+  migrate_legacy_config
+  [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || echo '{}'
+}
+
+write_config() {
+  # $1 = new config JSON on stdin
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  cat > "$CONFIG_FILE.tmp"
+  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+# Loads the active profile's credentials into SERVER_URL/USERNAME/PASSWORD.
+# Returns non-zero (with those left unset) if there's no active profile or
+# its password isn't in the keyring.
+load_active_profile() {
+  local cfg id
+  cfg=$(read_config)
+  id=$(jq -r '.activeProfileId // empty' <<<"$cfg")
+  [[ -n "$id" ]] || return 1
+  local profile
+  profile=$(jq -c --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg")
+  [[ -n "$profile" ]] || return 1
+  SERVER_URL=$(jq -r '.serverURL' <<<"$profile")
+  USERNAME=$(jq -r '.username' <<<"$profile")
+  [[ -n "$SERVER_URL" && "$SERVER_URL" != "null" && -n "$USERNAME" && "$USERNAME" != "null" ]] || return 1
+  PASSWORD=$(secret-tool lookup service "$SECRET_SERVICE" profile "$id" 2>/dev/null) || return 1
+  [[ -n "$PASSWORD" ]] || return 1
+  return 0
+}
+
+require_active_profile() {
+  load_active_profile || fail "not configured; run: dromify-api configure <name> <serverURL> <username> <password>"
+}
+
+normalize_url() {
+  local u="$1"
+  u="${u%/}"
+  printf '%s' "$u"
+}
+
+# Every profile is annotated with hasPassword: a logged-out profile (see
+# cmd_logout) keeps its saved name/serverURL/username but has no password
+# in the keyring, so it can't actually be used until signed back in.
+# "configured" requires the active profile to have one, not just to exist.
+cmd_status() {
+  local cfg active_id out p pid has
+  cfg=$(read_config)
+  active_id=$(jq -r '.activeProfileId // empty' <<<"$cfg")
+  out="[]"
+  while IFS= read -r p; do
+    pid=$(jq -r '.id' <<<"$p")
+    if secret-tool lookup service "$SECRET_SERVICE" profile "$pid" >/dev/null 2>&1; then
+      has=true
+    else
+      has=false
+    fi
+    out=$(jq -c --argjson p "$p" --argjson has "$has" '. + [$p + {hasPassword: $has}]' <<<"$out")
+  done < <(jq -c '(.profiles // [])[] | {id, name, serverURL, username}' <<<"$cfg")
+
+  local active="null"
+  if [[ -n "$active_id" ]]; then
+    active=$(jq -c --arg id "$active_id" '[.[] | select(.id == $id)][0] // null' <<<"$out")
+  fi
+  jq -n --argjson active "$active" --argjson profiles "$out" \
+    '{configured: ($active != null and ($active.hasPassword // false)), active: $active, profiles: $profiles}'
+}
+
+# Verifies serverURL/username/password against the real server. Prints the
+# server's error message and returns non-zero on failure.
+verify_credentials() {
+  local server="$1" username="$2" password="$3"
+  local salt token url body status
+  salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
+  token=$(printf '%s' "${password}${salt}" | md5sum | cut -d' ' -f1)
+  url="${server}/rest/ping.view?u=$(urlencode "$username")&t=${token}&s=${salt}&v=${API_VERSION}&c=${CLIENT_NAME}&f=json"
+  body=$(curl -fsS --max-time 10 "$url") || { echo "could not reach $server" >&2; return 1; }
+  status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
+  if [[ "$status" != "ok" ]]; then
+    printf '%s' "$body" | jq -r '.["subsonic-response"].error.message // "authentication failed"' >&2
+    return 1
+  fi
+  return 0
+}
+
+cmd_configure() {
+  local name="$1" server="$2" username="$3" password
+  password=$(read_secret_stdin)
+  [[ -n "$name" && -n "$server" && -n "$username" && -n "$password" ]] \
+    || fail "usage: configure <name> <serverURL> <username>   (password on stdin)"
+  [[ "$server" =~ ^https?:// ]] || fail "server URL must start with http:// or https://"
+  server=$(normalize_url "$server")
+
+  local err
+  err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
+
+  local id cfg next
+  id=$(new_id)
+  cfg=$(read_config)
+  next=$(jq -c --arg id "$id" --arg name "$name" --arg u "$server" --arg n "$username" '
+    (.profiles // []) as $existing
+    | { activeProfileId: $id, profiles: ($existing + [{id: $id, name: $name, serverURL: $u, username: $n}]) }
+  ' <<<"$cfg")
+  write_config <<<"$next"
+
+  secret-tool store --label="Dromify: $name ($username@$server)" \
+    service "$SECRET_SERVICE" profile "$id" <<<"$password" \
+    || fail "could not save password to the desktop keyring (is a Secret Service / gnome-keyring running?)"
+
+  echo "{\"ok\":true,\"id\":\"$id\"}"
+}
+
+cmd_switch() {
+  local id="$1"
+  [[ -n "$id" ]] || fail "usage: switch <profileId>"
+  local cfg
+  cfg=$(read_config)
+  jq -e --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg" >/dev/null 2>&1 \
+    || fail "no such profile: $id"
+  write_config < <(jq -c --arg id "$id" '.activeProfileId = $id' <<<"$cfg")
+  cmd_status
+}
+
+cmd_forget() {
+  local id="$1"
+  [[ -n "$id" ]] || fail "usage: forget <profileId>"
+  secret-tool clear service "$SECRET_SERVICE" profile "$id" >/dev/null 2>&1
+  local cfg next
+  cfg=$(read_config)
+  next=$(jq -c --arg id "$id" '
+    .profiles = ((.profiles // []) | map(select(.id != $id))) |
+    if .activeProfileId == $id then .activeProfileId = null else . end
+  ' <<<"$cfg")
+  write_config <<<"$next"
+  cmd_status
+}
+
+cmd_rename() {
+  local id="$1" name="$2"
+  [[ -n "$id" && -n "$name" ]] || fail "usage: rename <profileId> <newName>"
+  local cfg
+  cfg=$(read_config)
+  jq -e --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg" >/dev/null 2>&1 \
+    || fail "no such profile: $id"
+  write_config < <(jq -c --arg id "$id" --arg name "$name" '
+    .profiles = ((.profiles // []) | map(if .id == $id then .name = $name else . end))
+  ' <<<"$cfg")
+  cmd_status
+}
+
+# Clears a profile's stored password (forcing re-entry before it can be used
+# again) without deleting the saved name/serverURL/username — distinct from
+# `forget`, which removes the profile entirely. If it was the active
+# profile, nothing is active afterward.
+cmd_logout() {
+  local id="$1"
+  [[ -n "$id" ]] || fail "usage: logout <profileId>"
+  local cfg
+  cfg=$(read_config)
+  jq -e --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg" >/dev/null 2>&1 \
+    || fail "no such profile: $id"
+  secret-tool clear service "$SECRET_SERVICE" profile "$id" >/dev/null 2>&1
+  write_config < <(jq -c --arg id "$id" '
+    if .activeProfileId == $id then .activeProfileId = null else . end
+  ' <<<"$cfg")
+  cmd_status
+}
+
+# Signs back in to a logged-out profile: re-verifies the password against
+# its already-saved serverURL/username, stores it, and makes it active.
+cmd_relogin() {
+  local id="$1" password
+  password=$(read_secret_stdin)
+  [[ -n "$id" && -n "$password" ]] || fail "usage: relogin <profileId>   (password on stdin)"
+  local cfg profile server username name
+  cfg=$(read_config)
+  profile=$(jq -c --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg")
+  [[ -n "$profile" ]] || fail "no such profile: $id"
+  server=$(jq -r '.serverURL' <<<"$profile")
+  username=$(jq -r '.username' <<<"$profile")
+  name=$(jq -r '.name' <<<"$profile")
+
+  local err
+  err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
+
+  secret-tool store --label="Dromify: $name ($username@$server)" \
+    service "$SECRET_SERVICE" profile "$id" <<<"$password" \
+    || fail "could not save password to the desktop keyring"
+  write_config < <(jq -c --arg id "$id" '.activeProfileId = $id' <<<"$cfg")
+  cmd_status
+}
+
+# --- request building --------------------------------------------------------
+
+# Builds a fully authenticated URL for $1=endpoint, remaining args key=value.
+# Each call mints a fresh salt/token, matching the Subsonic spec (the server
+# doesn't require a stable token; only Dromify's own client caches one to
+# avoid image flicker across re-renders, which doesn't apply to a one-shot
+# CLI call).
+build_url() {
+  local endpoint="$1"; shift
+  require_active_profile
+  local salt token qs kv k v
+  salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
+  token=$(printf '%s' "${PASSWORD}${salt}" | md5sum | cut -d' ' -f1)
+  qs="u=$(urlencode "$USERNAME")&t=${token}&s=${salt}&v=${API_VERSION}&c=${CLIENT_NAME}&f=json"
+  for kv in "$@"; do
+    k="${kv%%=*}"
+    v="${kv#*=}"
+    qs+="&$(urlencode "$k")=$(urlencode "$v")"
+  done
+  printf '%s/rest/%s?%s' "$SERVER_URL" "$endpoint" "$qs"
+}
+
+cmd_url() {
+  local endpoint="$1"; shift
+  [[ -n "$endpoint" ]] || fail "usage: url <endpoint> [key=value ...]"
+  build_url "$endpoint" "$@"
+}
+
+# Batch form of `url` for building a whole queue's stream URLs in one
+# process instead of one dromify-api invocation per track: `urls
+# stream.view id1 id2 ...` prints one URL per line, same order as the ids.
+cmd_urls() {
+  local endpoint="$1"; shift
+  [[ -n "$endpoint" && $# -gt 0 ]] || fail "usage: urls <endpoint> <id1> [id2 ...]"
+  local id
+  for id in "$@"; do
+    build_url "$endpoint" "id=$id" || exit 1
+    echo
+  done
+}
+
+cmd_get() {
+  local endpoint="$1"; shift
+  [[ -n "$endpoint" ]] || fail "usage: get <endpoint> [key=value ...]"
+  local url body status
+  url=$(build_url "$endpoint" "$@") || exit 1
+  body=$(curl -fsS --max-time 15 "$url") || fail "request to $endpoint failed"
+  status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
+  if [[ "$status" != "ok" ]]; then
+    local msg
+    msg=$(printf '%s' "$body" | jq -r '.["subsonic-response"].error.message // "server error"')
+    fail "$msg"
+  fi
+  printf '%s' "$body" | jq -c '.["subsonic-response"]'
+}
+
+cmd_ping() {
+  cmd_get ping.view >/dev/null
+  echo '{"ok":true}'
+}
+
+# Copies a saved profile's password (straight from the keyring) to the
+# Wayland clipboard so it can be pasted into that server's web UI sign-in
+# form. With no argument it uses the active profile; with a profile id it
+# copies that one (the settings view lists every profile, active or not).
+# `--sensitive` makes wl-copy advertise x-kde-passwordManagerHint, which
+# Omarchy's own clipboard-history capture (plugins/clipboard/capture.sh)
+# treats as "do not store" — so the password reaches the paste target but
+# never the clipboard manager. The plaintext only ever travels this pipe;
+# it's never an argv or printed to stdout.
+cmd_copy_password() {
+  need wl-copy
+  local id="${1:-}"
+  local cfg
+  cfg=$(read_config)
+  [[ -n "$id" ]] || id=$(jq -r '.activeProfileId // empty' <<<"$cfg")
+  [[ -n "$id" ]] || fail "no profile id given and no active profile"
+  jq -e --arg id "$id" '(.profiles // [])[] | select(.id == $id)' <<<"$cfg" >/dev/null 2>&1 \
+    || fail "no such profile: $id"
+  local password
+  password=$(secret-tool lookup service "$SECRET_SERVICE" profile "$id" 2>/dev/null) \
+    || fail "no saved password for that profile (it may be signed out)"
+  [[ -n "$password" ]] || fail "no saved password for that profile (it may be signed out)"
+  printf '%s' "$password" | wl-copy --sensitive --trim-newline
+}
+
+# Downloads (and caches) cover art, printing the local file path. Cover art
+# rarely changes, so an id+size cache key is reused indefinitely; the panel
+# is the one place a stale cover would ever show and it can always fall back
+# to re-fetching by deleting the cache.
+cmd_cover() {
+  local id="$1" size="${2:-300}"
+  [[ -n "$id" ]] || fail "usage: cover <coverArtId> [size]"
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/dromify/covers"
+  mkdir -p "$cache_dir"
+  local safe_id
+  safe_id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')
+  local path="$cache_dir/${safe_id}-${size}.jpg"
+  if [[ ! -s "$path" ]]; then
+    local url
+    url=$(build_url "getCoverArt.view" "id=$id" "size=$size") || exit 1
+    curl -fsS --max-time 15 "$url" -o "$path.tmp" && mv "$path.tmp" "$path" || { rm -f "$path.tmp"; fail "could not fetch cover art"; }
+  fi
+  printf '%s' "$path"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    configure) cmd_configure "${1:-}" "${2:-}" "${3:-}" ;;
+    status) cmd_status ;;
+    switch) cmd_switch "${1:-}" ;;
+    forget) cmd_forget "${1:-}" ;;
+    rename) cmd_rename "${1:-}" "${2:-}" ;;
+    logout) cmd_logout "${1:-}" ;;
+    relogin) cmd_relogin "${1:-}" ;;
+    ping) cmd_ping ;;
+    get) cmd_get "$@" ;;
+    url) cmd_url "$@" ;;
+    urls) cmd_urls "$@" ;;
+    cover) cmd_cover "$@" ;;
+    copy-password) cmd_copy_password "${1:-}" ;;
+    *) fail "unknown command '$cmd' (expected: configure|status|switch|forget|rename|logout|relogin|ping|get|url|urls|cover|copy-password)" ;;
+  esac
+}
+
+main "$@"

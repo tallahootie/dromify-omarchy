@@ -1,0 +1,291 @@
+#!/bin/bash
+# dromify-player - manages a single, always-idle mpv instance used by
+# Dromify, the Omarchy plugin, controlled entirely over its JSON IPC socket.
+#
+# mpv's own playlist IS the play queue — load-queue hands it every track up
+# front. That's what makes native "playlist-next"/"playlist-prev" work, which
+# in turn is what makes mpv-mpris's MPRIS Next/Previous work, which is what
+# hardware media keys and `playerctl` actually call. An earlier version of
+# this script kept mpv's playlist empty (always just one file, "next" meant
+# the QML side loading a new URL) and system media-key skip/back silently did
+# nothing as a result — mpv had nothing in its own playlist to skip to.
+#
+# The QML side still decides *what* goes in the queue (an album, a playlist,
+# search results, ...) and reads mpv's own `playlist-pos` back (via `status`)
+# to know what's actually playing, rather than tracking it independently —
+# one authority for "what's playing," same as before, just now it's mpv's.
+#
+# If mpv-mpris is installed (pacman: mpv-mpris), it's loaded so system media
+# keys, the Omarchy Media bar widget, and any other MPRIS-aware tool pick up
+# playback for free.
+#
+# Usage:
+#   dromify-player load-queue <startIndex> <url1> <title1> [<url2> <title2> ...]
+#   dromify-player reorder-tail <url1> <title1> [<url2> <title2> ...]
+#   dromify-player next | previous          # mpv's own playlist navigation
+#   dromify-player pause | resume | toggle-pause | stop
+#   dromify-player seek <seconds>           # absolute position
+#   dromify-player volume <0-100>
+#   dromify-player set-repeat <off|all|one> # off, loop-playlist, or loop-file
+#   dromify-player status                   -> JSON transport snapshot
+#   dromify-player quit                     # fully stop the mpv instance
+
+set -uo pipefail
+
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+SOCK="$RUNTIME_DIR/dromify-mpv.sock"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/dromify/mpv.log"
+MPRIS_SO_CANDIDATES=(/usr/lib/mpv-mpris/mpris.so /etc/mpv/scripts/mpris.so)
+
+fail() { echo "dromify-player: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found on PATH"; }
+need mpv
+need socat
+need jq
+
+mpris_script() {
+  local p
+  for p in "${MPRIS_SO_CANDIDATES[@]}"; do
+    [[ -f "$p" ]] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+
+is_running() {
+  [[ -S "$SOCK" ]] || return 1
+  printf '%s\n' '{"command":["get_version"]}' | socat -t 1 - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1
+}
+
+ensure_mpv() {
+  is_running && return 0
+  rm -f "$SOCK"
+  mkdir -p "$(dirname "$LOG")"
+  local args=(--idle=yes --no-video --no-terminal --no-config
+              "--input-ipc-server=$SOCK" --volume=100)
+  local mpris_so
+  if mpris_so=$(mpris_script); then args+=("--script=$mpris_so"); fi
+  setsid mpv "${args[@]}" >>"$LOG" 2>&1 </dev/null &
+  disown
+  local i
+  for i in $(seq 1 50); do
+    [[ -S "$SOCK" ]] && is_running && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Sends one or more newline-separated JSON command objects over one
+# connection and prints mpv's replies (one JSON line per command, in order).
+ipc_send() {
+  printf '%s\n' "$1" | socat -t 3 - "UNIX-CONNECT:$SOCK" 2>/dev/null
+}
+
+json_string() { jq -Rn --arg v "${1:-}" '$v'; }
+
+# Warms mpv up in the background before the user has actually picked a
+# track. Spawning mpv cold can take a few seconds; calling this eagerly
+# (right after connecting) means that wait happens once, quietly, up front
+# instead of stalling the first real `load-queue` a user makes.
+cmd_ensure() {
+  ensure_mpv || fail "mpv failed to start (see $LOG)"
+  echo '{"ok":true}'
+}
+
+# Args come in <url> <title> pairs. Each track's title is baked in as a
+# *per-playlist-entry* force-media-title option (mpv's "Per-File Options"
+# mechanism: applied the moment mpv actually starts playing that entry,
+# restored to whatever it was before once that entry ends) rather than set
+# reactively after the fact with a separate set_property call. That
+# matters because mpv-mpris republishes its MPRIS Metadata (and so
+# triggers the system media notification) on its own ~100ms timer,
+# independent of and much faster than anything reacting to playlist-pos
+# from outside it — including the previous version of this function, which
+# only relabelled the *current* track's title up front and left next/
+# previous to fall back on Service.qml's ~800ms poll. That gap was long
+# enough for mpv-mpris to publish (and the OSD to show) the new file's own
+# raw, unlabelled metadata — sometimes a "Title - Artist" string baked into
+# the stream's own tag — paired with the *previous* track's Artist tag,
+# since mpv hadn't read the new stream's tags yet either. Baking the title
+# into the playlist entry itself means it's already correct the instant
+# mpv switches to it, regardless of *why* it switched: this panel's own
+# next/previous, a hardware media key (which goes straight through
+# playerctl/D-Bus to mpv-mpris's Next()/Previous(), never touching this
+# script), or mpv just finishing a track and auto-advancing on its own.
+cmd_load_queue() {
+  local start="$1"; shift
+  [[ $# -gt 0 && $(($# % 2)) -eq 0 ]] || fail "usage: load-queue <startIndex> <url1> <title1> [<url2> <title2> ...]"
+  ensure_mpv || fail "mpv failed to start (see $LOG)"
+  local cmds="{\"command\":[\"playlist-clear\"]}"
+  local first=1 url title u mode opts
+  while [[ $# -gt 0 ]]; do
+    url="$1" title="$2"; shift 2
+    u=$(json_string "$url")
+    mode=$([[ $first -eq 1 ]] && echo "replace" || echo "append")
+    first=0
+    if [[ -n "$title" ]]; then
+      # A JSON object, not mpv's "opt1=value1,opt2=value2" option-string
+      # syntax — that mini-language has its own comma/equals escaping to
+      # worry about; the JSON IPC accepts per-file options as a plain map
+      # instead, so a title with a comma or an equals sign in it needs no
+      # special handling at all.
+      opts=$(jq -cn --arg t "$title" '{"force-media-title": $t}')
+      cmds+=$'\n'"{\"command\":[\"loadfile\",$u,\"$mode\",-1,$opts]}"
+    else
+      cmds+=$'\n'"{\"command\":[\"loadfile\",$u,\"$mode\"]}"
+    fi
+  done
+  cmds+=$'\n''{"command":["set_property","pause",false]}'
+  if [[ "$start" =~ ^[0-9]+$ ]] && [[ "$start" -gt 0 ]]; then
+    cmds+=$'\n'"{\"command\":[\"set_property\",\"playlist-pos\",$start]}"
+  fi
+  ipc_send "$cmds" >/dev/null
+  echo '{"ok":true}'
+}
+
+# Rewrites just the not-yet-played tail of mpv's own playlist in place —
+# used by toggleShuffle to shuffle (or restore) everything after the
+# currently playing entry without disturbing it. mpv's playlist-clear only
+# clears "except the currently played file", with nothing to also keep
+# untouched history before it, and a full load-queue reload of the whole
+# thing (including the current entry, via a "replace" loadfile) means mpv
+# closes and reopens the stream that's already playing — an audible pause
+# every time, even once it correctly resumes at the right position
+# afterward. Since only the tail ever needs to change here, this instead
+# reads mpv's own playlist-pos/-count, removes just the entries after the
+# current one (highest index first, so each removal doesn't shift the
+# index of the next one to remove), and appends the new tail fresh. The
+# current entry is never named in a loadfile call, so mpv never touches
+# its stream at all.
+cmd_reorder_tail() {
+  is_running || fail "reorder-tail: mpv is not running"
+  local reply pos count i cmds=""
+  reply=$(ipc_send $'{"command":["get_property","playlist-pos"]}\n{"command":["get_property","playlist-count"]}')
+  pos=$(jq -cs '.[0].data // 0' <<<"$reply")
+  count=$(jq -cs '.[1].data // 0' <<<"$reply")
+  for ((i = count - 1; i > pos; i--)); do
+    cmds+="{\"command\":[\"playlist-remove\",$i]}"$'\n'
+  done
+  local url title u opts
+  while [[ $# -gt 0 ]]; do
+    url="$1" title="$2"; shift 2
+    u=$(json_string "$url")
+    if [[ -n "$title" ]]; then
+      opts=$(jq -cn --arg t "$title" '{"force-media-title": $t}')
+      cmds+="{\"command\":[\"loadfile\",$u,\"append\",-1,$opts]}"$'\n'
+    else
+      cmds+="{\"command\":[\"loadfile\",$u,\"append\"]}"$'\n'
+    fi
+  done
+  [[ -n "$cmds" ]] && ipc_send "$cmds" >/dev/null
+  echo '{"ok":true}'
+}
+
+cmd_simple() {
+  # $1 = human command name (for errors), $2 = the JSON command to send
+  is_running || fail "$1: mpv is not running"
+  ipc_send "$2" >/dev/null
+  echo '{"ok":true}'
+}
+
+cmd_seek() {
+  local secs="${1:-0}"
+  cmd_simple "seek" "{\"command\":[\"seek\",$secs,\"absolute\"]}"
+}
+
+cmd_volume() {
+  local vol="${1:-100}"
+  cmd_simple "volume" "{\"command\":[\"set_property\",\"volume\",$vol]}"
+}
+
+# Repeat is delegated entirely to mpv's own loop properties rather than
+# tracked client-side: "off" clears both, "all" loops the playlist (so a
+# "weak" next/previous at either end wraps instead of stopping), "one"
+# loops just the current file (playlist-pos never changes, so the queue
+# poll's advance/scrobble logic naturally does nothing while it repeats).
+cmd_set_repeat() {
+  local mode="$1"
+  is_running || fail "set-repeat: mpv is not running"
+  case "$mode" in
+    off) ipc_send $'{"command":["set_property","loop-playlist","no"]}\n{"command":["set_property","loop-file","no"]}' >/dev/null ;;
+    all) ipc_send $'{"command":["set_property","loop-playlist","inf"]}\n{"command":["set_property","loop-file","no"]}' >/dev/null ;;
+    one) ipc_send $'{"command":["set_property","loop-playlist","no"]}\n{"command":["set_property","loop-file","inf"]}' >/dev/null ;;
+    *) fail "usage: set-repeat <off|all|one>" ;;
+  esac
+  echo '{"ok":true}'
+}
+
+cmd_status() {
+  if ! is_running; then
+    echo '{"running":false,"paused":true,"position":0,"duration":0,"idle":true,"eof":false,"volume":100,"path":"","playlistPos":-1,"playlistCount":0,"audioCodec":"","audioBitrate":0}'
+    return 0
+  fi
+  local req reply
+  req=$(printf '%s\n' \
+    '{"command":["get_property","pause"]}' \
+    '{"command":["get_property","time-pos"]}' \
+    '{"command":["get_property","duration"]}' \
+    '{"command":["get_property","idle-active"]}' \
+    '{"command":["get_property","eof-reached"]}' \
+    '{"command":["get_property","volume"]}' \
+    '{"command":["get_property","path"]}' \
+    '{"command":["get_property","playlist-pos"]}' \
+    '{"command":["get_property","playlist-count"]}' \
+    '{"command":["get_property","audio-codec-name"]}' \
+    '{"command":["get_property","audio-bitrate"]}')
+  reply=$(ipc_send "$req")
+  # Note: deliberately not using jq's `//` here — it treats a JSON `false`
+  # as absent (same as null), which would silently turn a real "not paused"
+  # / "not idle" reading back into true. `orDefault` only fills in for an
+  # actual null.
+  jq -cs '
+    def orDefault(d): if . == null then d else . end;
+    {
+      running: true,
+      paused:   (.[0].data | orDefault(true)),
+      position: (.[1].data | orDefault(0) | if type == "number" then . else 0 end),
+      duration: (.[2].data | orDefault(0) | if type == "number" then . else 0 end),
+      idle:     (.[3].data | orDefault(true)),
+      eof:      (.[4].data | orDefault(false)),
+      volume:   (.[5].data | orDefault(100)),
+      path:     (.[6].data | orDefault("")),
+      playlistPos:   (.[7].data | orDefault(-1)),
+      playlistCount: (.[8].data | orDefault(0)),
+      audioCodec:    (.[9].data | orDefault("")),
+      audioBitrate:  (.[10].data | orDefault(0) | if type == "number" then . else 0 end)
+    }' <<<"$reply"
+}
+
+cmd_stop() {
+  is_running || { echo '{"ok":true}'; return 0; }
+  ipc_send $'{"command":["stop"]}\n{"command":["playlist-clear"]}' >/dev/null
+  echo '{"ok":true}'
+}
+
+cmd_quit() {
+  is_running || { echo '{"ok":true}'; return 0; }
+  ipc_send '{"command":["quit"]}' >/dev/null
+  echo '{"ok":true}'
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ensure) cmd_ensure ;;
+    load-queue) cmd_load_queue "${1:-0}" "${@:2}" ;;
+    reorder-tail) cmd_reorder_tail "$@" ;;
+    next) cmd_simple "next" '{"command":["playlist-next","weak"]}' ;;
+    previous) cmd_simple "previous" '{"command":["playlist-prev","weak"]}' ;;
+    pause) cmd_simple "pause" '{"command":["set_property","pause",true]}' ;;
+    resume) cmd_simple "resume" '{"command":["set_property","pause",false]}' ;;
+    toggle-pause) cmd_simple "toggle-pause" '{"command":["cycle","pause"]}' ;;
+    seek) cmd_seek "${1:-0}" ;;
+    volume) cmd_volume "${1:-100}" ;;
+    set-repeat) cmd_set_repeat "${1:-}" ;;
+    status) cmd_status ;;
+    stop) cmd_stop ;;
+    quit) cmd_quit ;;
+    *) fail "unknown command '$cmd' (expected: ensure|load-queue|reorder-tail|next|previous|pause|resume|toggle-pause|seek|volume|set-repeat|status|stop|quit)" ;;
+  esac
+}
+
+main "$@"
