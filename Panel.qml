@@ -507,7 +507,7 @@ Panel {
                 spacing: Style.space(6)
 
                 Repeater {
-                  model: [["albums", "Albums"], ["artists", "Artists"], ["playlists", "Playlists"], ["favorites", "Favorites"]]
+                  model: [["albums", "Albums"], ["artists", "Artists"], ["playlists", "Playlists"], ["favorites", "Favourites"]]
                   delegate: TabButton {
                     required property var modelData
                     required property int index
@@ -934,10 +934,17 @@ Panel {
 
       Text {
         visible: itemRow.kind === "song"
-        text: itemRow.isPlayingSong
-          ? (nav.playing && !nav.paused ? "󰐊" : "󰏤")
-          : (itemRow.listPos > 0 ? String(itemRow.listPos)
-             : (itemRow.item && itemRow.item.track ? String(itemRow.item.track) : "•"))
+        // Playing track -> play/pause glyph. Playlist -> its 1-based
+        // position. Album -> the track's own album track number. Flat song
+        // lists (Favourites, search results) have no meaningful number, so
+        // show nothing.
+        text: {
+          if (itemRow.isPlayingSong) return nav.playing && !nav.paused ? "󰐊" : "󰏤"
+          if (itemRow.listPos > 0) return String(itemRow.listPos)
+          if (nav.topFrame && nav.topFrame.kind === "albumSongs")
+            return itemRow.item && itemRow.item.track ? String(itemRow.item.track) : "•"
+          return ""
+        }
         color: itemRow.isPlayingSong ? Color.accent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1180,7 +1187,7 @@ Panel {
         }
         PanelActionButton {
           iconText: (npBar.song && npBar.song.starred) ? "󰓎" : "󰓒"
-          tooltipText: "Favorite"
+          tooltipText: "Favourite"
           foreground: (npBar.song && npBar.song.starred) ? Color.accent : root.foreground
           fontFamily: root.fontFamily
           onClicked: nav.toggleFavorite(npBar.song)
