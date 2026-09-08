@@ -44,6 +44,7 @@ set -uo pipefail
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}"
 SOCK="$RUNTIME_DIR/dromify-mpv.sock"
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/dromify/mpv.log"
+LOCK="$RUNTIME_DIR/dromify-mpv.lock"
 MPRIS_SO_CANDIDATES=(/usr/lib/mpv-mpris/mpris.so /etc/mpv/scripts/mpris.so)
 
 fail() { echo "dromify-player: $*" >&2; exit 1; }
@@ -51,6 +52,7 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found
 need mpv
 need socat
 need jq
+need flock
 
 mpris_script() {
   local p
@@ -75,19 +77,38 @@ harden_log() {
 
 ensure_mpv() {
   is_running && return 0
+  # Serialise the spawn. Without this, two near-simultaneous invocations
+  # (the warm-up `ensure` and the first `load-queue`, say) both see no
+  # socket, both `rm -f` it, and both start mpv — leaving orphan mpv +
+  # mpv-mpris instances fighting over the same IPC path, which shows up as
+  # playback "jumping back" to whatever a different instance still has
+  # queued. flock makes the loser wait, then fall through to the recheck
+  # below and reuse the winner's mpv.
+  local lock_fd
+  exec {lock_fd}>"$LOCK"
+  flock "$lock_fd"
+  if is_running; then exec {lock_fd}>&-; return 0; fi
+  # Socket is dead or gone: reap any orphan mpv still bound to this path
+  # (from a crash or a pre-lock race) so a clean single instance replaces
+  # them. Safe here precisely because is_running just failed.
+  pkill -f -- "--input-ipc-server=$SOCK" 2>/dev/null || true
   rm -f "$SOCK"
   harden_log
   local args=(--idle=yes --no-video --no-terminal --no-config
               "--input-ipc-server=$SOCK" --volume=100)
   local mpris_so
   if mpris_so=$(mpris_script); then args+=("--script=$mpris_so"); fi
-  setsid mpv "${args[@]}" >>"$LOG" 2>&1 </dev/null &
+  # {lock_fd}>&- closes the lock fd in the mpv child only: otherwise mpv
+  # inherits it and holds the flock for its whole lifetime, deadlocking
+  # every later ensure. The parent keeps the lock through the wait below.
+  setsid mpv "${args[@]}" >>"$LOG" 2>&1 </dev/null {lock_fd}>&- &
   disown
   local i
   for i in $(seq 1 50); do
-    [[ -S "$SOCK" ]] && is_running && return 0
+    if [[ -S "$SOCK" ]] && is_running; then exec {lock_fd}>&-; return 0; fi
     sleep 0.1
   done
+  exec {lock_fd}>&-
   return 1
 }
 
