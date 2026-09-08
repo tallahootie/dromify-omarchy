@@ -933,7 +933,10 @@ Panel {
       }
 
       Text {
-        visible: itemRow.kind === "song"
+        // Hidden (not just blank) when there's nothing to show, so the
+        // RowLayout drops its width and spacing and the title lines up with
+        // the artist/album rows above instead of sitting in an empty gutter.
+        visible: itemRow.kind === "song" && text !== ""
         // Playing track -> play/pause glyph. Playlist -> its 1-based
         // position. Album -> the track's own album track number. Flat song
         // lists (Favourites, search results) have no meaningful number, so
