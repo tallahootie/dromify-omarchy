@@ -38,7 +38,8 @@ Omarchy theme, not the app's.
 - Keyboard-driven: `j`/`k` to move, `Enter` to activate, `/` to search, `f`
   to favourite, `r` to refresh, `Esc` to go back
 - Passwords live in the desktop keyring (`secret-tool` / libsecret), not in
-  a config file
+  a config file; the password and the authenticated stream URLs are passed
+  between the helpers over stdin, never on the command line
 - The server name in the header links to its web UI; each settings row has
   a copy-password button for the first sign-in there
 

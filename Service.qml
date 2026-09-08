@@ -578,13 +578,19 @@ Item {
   // just as correctly (same per-file timing), and the system media widget
   // appends it after this title itself, so folding the artist in here too
   // made it show up twice.
-  function _urlsWithTitles(songs, urls) {
-    var args = []
+  // Builds the stdin payload for dromify-player load-queue / reorder-tail:
+  // url and title on their own lines, one pair per track. The stream URLs
+  // carry the Subsonic salt+token, so they go over stdin, never argv (see
+  // _runWithSecret). Titles are forced onto a single line — they're only a
+  // cosmetic force-media-title, and a newline would desync the pairing.
+  function _queuePayload(songs, urls) {
+    var lines = []
     for (var i = 0; i < urls.length; i++) {
-      args.push(urls[i])
-      args.push(songs[i] ? Model.nowPlayingLabel(songs[i]) : "")
+      var title = songs[i] ? Model.nowPlayingLabel(songs[i]) : ""
+      lines.push(urls[i])
+      lines.push(String(title).replace(/[\r\n]+/g, " "))
     }
-    return args
+    return lines.join("\n")
   }
 
   // Plays `songs[startIndex]`, queuing the rest of `songs` behind it as the
@@ -606,8 +612,11 @@ Item {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
-      var args = [playerBin, "load-queue", String(startIndex)].concat(_urlsWithTitles(songs, urls))
-      _run(playQueueProcess, args, function() {
+      if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
+      _runWithSecret(playQueueProcess,
+                     [playerBin, "load-queue", String(startIndex), String(urls.length)],
+                     _queuePayload(songs, urls),
+                     function() {
         if (gen !== _playGen) return
         loading = false
         paused = false
@@ -696,8 +705,11 @@ Item {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
-      var args = [playerBin, "reorder-tail"].concat(_urlsWithTitles(tail, urls))
-      _run(playQueueProcess, args, function() {
+      if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
+      _runWithSecret(playQueueProcess,
+                     [playerBin, "reorder-tail", String(urls.length)],
+                     _queuePayload(tail, urls),
+                     function() {
         if (gen !== _playGen) return
         loading = false
       })
@@ -889,10 +901,12 @@ Item {
     return true
   }
 
-  // Like _run, but stashes a one-line secret for the Process to write to the
-  // child's stdin from its onStarted handler. Keeps passwords out of argv
-  // (which is world-readable via /proc) — dromify-api's configure/relogin
-  // read the password from stdin for the same reason.
+  // Like _run, but stashes a payload for the Process to write to the child's
+  // stdin from its onStarted handler, keeping it out of argv (world-readable
+  // via /proc/<pid>/cmdline). Used for the server password (dromify-api
+  // configure/relogin) and for the stream-URL queue (dromify-player
+  // load-queue/reorder-tail) — those URLs carry the Subsonic salt+token,
+  // which is a replayable credential.
   function _runWithSecret(proc, command, secret, callback) {
     if (proc.running) return false
     proc._cb = callback
@@ -992,12 +1006,23 @@ Item {
   // Separate from playerCtlProcess so a track load never contends with an
   // unrelated transport call (pause/seek/volume/next/previous) sharing the
   // same Process object and getting silently dropped by _run's busy guard.
+  // Always driven via _runWithSecret: the queue's stream URLs (which carry
+  // the Subsonic token) are written to stdin from onStarted, never argv.
   Process {
     id: playQueueProcess
     property var _cb: null
+    property string _secret: ""
+    stdinEnabled: true
     running: false
     stdout: StdioCollector { waitForEnd: true }
+    onStarted: {
+      if (playQueueProcess._secret !== "") {
+        playQueueProcess.write(playQueueProcess._secret + "\n")
+        playQueueProcess._secret = ""
+      }
+    }
     onExited: function(exitCode) {
+      playQueueProcess._secret = ""
       var cb = playQueueProcess._cb; playQueueProcess._cb = null
       if (cb) cb()
     }

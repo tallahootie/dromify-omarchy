@@ -19,9 +19,18 @@
 # keys, the Omarchy Media bar widget, and any other MPRIS-aware tool pick up
 # playback for free.
 #
+# Stream URLs carry the Subsonic salt+token (`u`, `t`, `s`) — a replayable
+# credential equivalent to the password for the life of the token. They are
+# therefore passed to load-queue/reorder-tail on stdin, never in argv:
+# /proc/<pid>/cmdline is world-readable, so an argv URL would leak the token
+# to every local user for as long as this helper runs.
+#
 # Usage:
-#   dromify-player load-queue <startIndex> <url1> <title1> [<url2> <title2> ...]
-#   dromify-player reorder-tail <url1> <title1> [<url2> <title2> ...]
+#   dromify-player load-queue <startIndex> <count>   # then <count> url\ntitle\n
+#                                                    # pairs (one field per line)
+#                                                    # on stdin
+#   dromify-player reorder-tail <count>              # <count> url\ntitle\n pairs
+#                                                    # on stdin
 #   dromify-player next | previous          # mpv's own playlist navigation
 #   dromify-player pause | resume | toggle-pause | stop
 #   dromify-player seek <seconds>           # absolute position
@@ -56,10 +65,18 @@ is_running() {
   printf '%s\n' '{"command":["get_version"]}' | socat -t 1 - "UNIX-CONNECT:$SOCK" >/dev/null 2>&1
 }
 
+# mpv runs with --no-terminal, so in normal use it writes no stream URLs to
+# $LOG — but keep the file owner-only regardless, so a stray error line
+# can't expose a Subsonic token to other local users.
+harden_log() {
+  mkdir -p "$(dirname "$LOG")"
+  : >>"$LOG" && chmod 600 "$LOG" 2>/dev/null || true
+}
+
 ensure_mpv() {
   is_running && return 0
   rm -f "$SOCK"
-  mkdir -p "$(dirname "$LOG")"
+  harden_log
   local args=(--idle=yes --no-video --no-terminal --no-config
               "--input-ipc-server=$SOCK" --volume=100)
   local mpris_so
@@ -81,6 +98,24 @@ ipc_send() {
 }
 
 json_string() { jq -Rn --arg v "${1:-}" '$v'; }
+
+# Reads $1 url/title records from stdin into QUEUE_URLS / QUEUE_TITLES, one
+# field per line (url line, then title line, repeated). Used by
+# load-queue/reorder-tail so the token-bearing stream URLs never touch argv
+# (see the note at the top of this file). Titles are newline-free by
+# construction on the QML side; a missing line is a hard error rather than
+# a silently short queue.
+read_queue_stdin() {
+  local want="$1" i url title
+  QUEUE_URLS=()
+  QUEUE_TITLES=()
+  for (( i = 0; i < want; i++ )); do
+    IFS= read -r url    || fail "stdin ended after $i of $want url/title records"
+    IFS= read -r title  || fail "stdin ended mid-record ($i of $want: url with no title line)"
+    QUEUE_URLS+=("$url")
+    QUEUE_TITLES+=("$title")
+  done
+}
 
 # Warms mpv up in the background before the user has actually picked a
 # track. Spawning mpv cold can take a few seconds; calling this eagerly
@@ -112,13 +147,15 @@ cmd_ensure() {
 # playerctl/D-Bus to mpv-mpris's Next()/Previous(), never touching this
 # script), or mpv just finishing a track and auto-advancing on its own.
 cmd_load_queue() {
-  local start="$1"; shift
-  [[ $# -gt 0 && $(($# % 2)) -eq 0 ]] || fail "usage: load-queue <startIndex> <url1> <title1> [<url2> <title2> ...]"
+  local start="$1" count="${2:-}"
+  [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ && "$count" -ge 1 ]] \
+    || fail "usage: load-queue <startIndex> <count>   (<count> url/title lines on stdin)"
+  read_queue_stdin "$count"
   ensure_mpv || fail "mpv failed to start (see $LOG)"
   local cmds="{\"command\":[\"playlist-clear\"]}"
-  local first=1 url title u mode opts
-  while [[ $# -gt 0 ]]; do
-    url="$1" title="$2"; shift 2
+  local first=1 i url title u mode opts
+  for (( i = 0; i < count; i++ )); do
+    url="${QUEUE_URLS[$i]}" title="${QUEUE_TITLES[$i]}"
     u=$(json_string "$url")
     mode=$([[ $first -eq 1 ]] && echo "replace" || echo "append")
     first=0
@@ -157,17 +194,21 @@ cmd_load_queue() {
 # current entry is never named in a loadfile call, so mpv never touches
 # its stream at all.
 cmd_reorder_tail() {
+  local count="${1:-}"
+  [[ "$count" =~ ^[0-9]+$ ]] \
+    || fail "usage: reorder-tail <count>   (<count> url/title lines on stdin)"
+  read_queue_stdin "$count"
   is_running || fail "reorder-tail: mpv is not running"
-  local reply pos count i cmds=""
+  local reply pos plcount i cmds=""
   reply=$(ipc_send $'{"command":["get_property","playlist-pos"]}\n{"command":["get_property","playlist-count"]}')
   pos=$(jq -cs '.[0].data // 0' <<<"$reply")
-  count=$(jq -cs '.[1].data // 0' <<<"$reply")
-  for ((i = count - 1; i > pos; i--)); do
+  plcount=$(jq -cs '.[1].data // 0' <<<"$reply")
+  for ((i = plcount - 1; i > pos; i--)); do
     cmds+="{\"command\":[\"playlist-remove\",$i]}"$'\n'
   done
   local url title u opts
-  while [[ $# -gt 0 ]]; do
-    url="$1" title="$2"; shift 2
+  for (( i = 0; i < count; i++ )); do
+    url="${QUEUE_URLS[$i]}" title="${QUEUE_TITLES[$i]}"
     u=$(json_string "$url")
     if [[ -n "$title" ]]; then
       opts=$(jq -cn --arg t "$title" '{"force-media-title": $t}')
@@ -269,10 +310,11 @@ cmd_quit() {
 
 main() {
   local cmd="${1:-}"; shift || true
+  harden_log
   case "$cmd" in
     ensure) cmd_ensure ;;
-    load-queue) cmd_load_queue "${1:-0}" "${@:2}" ;;
-    reorder-tail) cmd_reorder_tail "$@" ;;
+    load-queue) cmd_load_queue "${1:-0}" "${2:-}" ;;
+    reorder-tail) cmd_reorder_tail "${1:-}" ;;
     next) cmd_simple "next" '{"command":["playlist-next","weak"]}' ;;
     previous) cmd_simple "previous" '{"command":["playlist-prev","weak"]}' ;;
     pause) cmd_simple "pause" '{"command":["set_property","pause",true]}' ;;
