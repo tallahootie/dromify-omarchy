@@ -216,7 +216,14 @@ Item {
     if (root.searchActive) return root.combinedRows(root.searchResults)
     if (root.topFrame) {
       var kind = root.topFrame.kind === "artistAlbums" ? "album" : "song"
-      return root.topFrame.items.map(function(it) { return { type: kind, data: it } })
+      // A playlist's rows are numbered by their position in the playlist,
+      // not each track's own album track number — so carry that 1-based
+      // position on the row for the panel to show.
+      var isPlaylist = root.topFrame.kind === "playlistSongs"
+      return root.topFrame.items.map(function(it, i) {
+        return isPlaylist ? { type: kind, data: it, listPos: i + 1 }
+                          : { type: kind, data: it }
+      })
     }
     if (root.activeTab === "albums") return root.tabAlbums.map(function(a) { return { type: "album", data: a } })
     if (root.activeTab === "artists") return root.tabArtists.map(function(a) { return { type: "artist", data: a } })

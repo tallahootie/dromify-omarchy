@@ -873,6 +873,9 @@ Panel {
     }
     readonly property var item: rowData ? rowData.data : null
     readonly property string kind: rowData ? rowData.type : ""
+    // Set on playlist rows: the 1-based position in the playlist, shown in
+    // place of the track's own album track number.
+    readonly property int listPos: (rowData && rowData.listPos) ? rowData.listPos : -1
     readonly property bool isPlayingSong: kind === "song" && item && nav.currentSong && item.id === nav.currentSong.id
 
     hasCursor: nav.cursorActive && nav.focusSection === "list" && navIndex >= 0 && nav.listIndex === navIndex
@@ -933,7 +936,8 @@ Panel {
         visible: itemRow.kind === "song"
         text: itemRow.isPlayingSong
           ? (nav.playing && !nav.paused ? "󰐊" : "󰏤")
-          : (itemRow.item ? (itemRow.item.track ? String(itemRow.item.track) : "•") : "")
+          : (itemRow.listPos > 0 ? String(itemRow.listPos)
+             : (itemRow.item && itemRow.item.track ? String(itemRow.item.track) : "•"))
         color: itemRow.isPlayingSong ? Color.accent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
