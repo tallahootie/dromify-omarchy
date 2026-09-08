@@ -10,9 +10,12 @@
 # in the desktop keyring via secret-tool (libsecret), matching the app's use
 # of the system Keychain rather than a plaintext blob.
 #
-# The password for configure/relogin is read from stdin (one line), never
-# taken as an argument -- argv is world-readable via /proc, so a secret
-# must never appear there.
+# argv is world-readable via /proc/<pid>/cmdline, so no secret ever goes
+# there: the password for configure/relogin is read from stdin, and every
+# request URL (which carries the replayable salt+token) is handed to curl
+# through a stdin `-K` config, not as an argument. The `url`/`urls`
+# subcommands print those URLs to stdout for the caller to pipe onward --
+# a pipe, never an argv.
 #
 # Usage:
 #   dromify-api configure <name> <serverURL> <username>   # password on stdin
@@ -66,6 +69,23 @@ read_secret_stdin() {
   local s
   IFS= read -r s || true
   printf '%s' "$s"
+}
+
+# curl against a fully-authenticated URL without putting it in argv. Every
+# request URL carries the Subsonic salt+token (`t`, `s`) — a replayable
+# credential — and /proc/<pid>/cmdline is world-readable, so the URL is fed
+# to curl through a `-K` config on stdin instead. Non-secret options
+# (--max-time, -o ...) still go on the command line as "$@". A legit authed
+# URL is whitespace/quote/control-char free (jq's @uri encodes the lot);
+# anything else is rejected so it can't break out of the config value.
+curl_auth() {
+  local url="$1"; shift
+  case $url in
+    *[[:space:]]* | *[[:cntrl:]]* | *'"'*) fail "refusing to request a malformed URL" ;;
+  esac
+  curl -fsS -K - "$@" <<CURLCFG
+url = "$url"
+CURLCFG
 }
 
 # --- config storage ----------------------------------------------------------
@@ -206,7 +226,7 @@ verify_credentials() {
   salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
   token=$(printf '%s' "${password}${salt}" | md5sum | cut -d' ' -f1)
   url="${server}/rest/ping.view?u=$(urlencode "$username")&t=${token}&s=${salt}&v=${API_VERSION}&c=${CLIENT_NAME}&f=json"
-  body=$(curl -fsS --max-time 10 "$url") || { echo "could not reach $server" >&2; return 1; }
+  body=$(curl_auth "$url" --max-time 10) || { echo "could not reach $server" >&2; return 1; }
   status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
   if [[ "$status" != "ok" ]]; then
     printf '%s' "$body" | jq -r '.["subsonic-response"].error.message // "authentication failed"' >&2
@@ -368,7 +388,7 @@ cmd_get() {
   [[ -n "$endpoint" ]] || fail "usage: get <endpoint> [key=value ...]"
   local url body status
   url=$(build_url "$endpoint" "$@") || exit 1
-  body=$(curl -fsS --max-time 15 "$url") || fail "request to $endpoint failed"
+  body=$(curl_auth "$url" --max-time 15) || fail "request to $endpoint failed"
   status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
   if [[ "$status" != "ok" ]]; then
     local msg
@@ -423,7 +443,7 @@ cmd_cover() {
   if [[ ! -s "$path" ]]; then
     local url
     url=$(build_url "getCoverArt.view" "id=$id" "size=$size") || exit 1
-    curl -fsS --max-time 15 "$url" -o "$path.tmp" && mv "$path.tmp" "$path" || { rm -f "$path.tmp"; fail "could not fetch cover art"; }
+    curl_auth "$url" --max-time 15 -o "$path.tmp" && mv "$path.tmp" "$path" || { rm -f "$path.tmp"; fail "could not fetch cover art"; }
   fi
   printf '%s' "$path"
 }
