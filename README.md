@@ -92,6 +92,32 @@ click next.
 back. `/` searches, `f` favourites, `r` refreshes. Hardware media keys and
 `playerctl` work too.
 
+## Server URL: use HTTPS
+
+The Subsonic auth scheme sends a salted token (`t`/`s`) with every request.
+It's replayable, and the salt is right there for an offline crack of the
+password, so it must not travel a network in the clear. Dromify therefore
+**requires `https://`** for the server URL. The one exception is a **loopback**
+address — `http://127.0.0.1[:port]` / `http://localhost[:port]` /
+`http://[::1][:port]` — for Navidrome running on the same machine as the bar,
+where there is no network to sniff.
+
+### Getting HTTPS on a home server
+
+Cleanest option, and it doubles as remote access — Tailscale fetches a real
+Let's Encrypt cert and terminates TLS in front of Navidrome:
+
+```
+# one-time: enable HTTPS certs at https://login.tailscale.com/admin/dns
+tailscale serve --bg 4533        # https://<host>.<tailnet>.ts.net -> http://127.0.0.1:4533
+```
+
+Then use `https://<your-host>.<your-tailnet>.ts.net` as the server URL — the
+same address resolves on the LAN (routed directly) and from anywhere on your
+tailnet, no port-forwarding, cert auto-renewed, config persists across
+reboots. A reverse proxy with a Let's Encrypt cert (Caddy does this
+automatically) or Navidrome's own `ND_TLSCERT` / `ND_TLSKEY` work equally well.
+
 ## Remove
 
 ```

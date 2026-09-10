@@ -153,6 +153,7 @@ Panel {
     implicitHeight: root.barSize
 
     Text {
+      textFormat: Text.PlainText
       anchors.centerIn: parent
       text: "󰝚"
       color: (nav.playing && !nav.paused) ? Color.accent : root.barIconColor
@@ -225,6 +226,7 @@ Panel {
             spacing: Style.space(6)
 
             Text {
+              textFormat: Text.PlainText
               text: "Dromify"
               color: root.foreground
               font.family: root.fontFamily
@@ -233,6 +235,7 @@ Panel {
               Layout.alignment: Qt.AlignVCenter
             }
             Text {
+              textFormat: Text.PlainText
               text: "for Omarchy"
               color: root.dim
               font.family: root.fontFamily
@@ -251,6 +254,7 @@ Panel {
           // page; the password is copied on demand from the gear/settings
           // view instead.
           Text {
+            textFormat: Text.PlainText
             id: serverLink
             visible: nav.configured && !nav.showSettings && nav.activeProfile
                      && !!nav.activeProfile.serverURL
@@ -328,6 +332,7 @@ Panel {
             spacing: Style.space(8)
 
             Text {
+              textFormat: Text.PlainText
               visible: nav.profiles.length === 0
               text: "Connect to your Navidrome or Subsonic server"
               color: root.dim
@@ -373,6 +378,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: nav.lastError !== ""
               text: nav.lastError
               color: root.urgent
@@ -536,6 +542,7 @@ Panel {
                   onClicked: nav.popFrame()
                 }
                 Text {
+                  textFormat: Text.PlainText
                   text: nav.listTitle
                   color: root.foreground
                   font.family: root.fontFamily
@@ -568,6 +575,7 @@ Panel {
                 // than the visible frame — pinning the text to the top. Center
                 // against the Flickable's own viewport dimensions instead.
                 Text {
+                  textFormat: Text.PlainText
                   visible: nav.listLoading
                   x: (panelFlick.width - implicitWidth) / 2
                   y: (panelFlick.height - implicitHeight) / 2
@@ -578,6 +586,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   visible: !nav.listLoading && nav.navigableRows.length === 0 && nav.rows.length === 0
                   x: (panelFlick.width - implicitWidth) / 2
                   y: (panelFlick.height - implicitHeight) / 2
@@ -663,6 +672,7 @@ Panel {
     }
 
     Text {
+      textFormat: Text.PlainText
       id: tabLabel
       anchors.centerIn: parent
       anchors.verticalCenterOffset: -Style.space(2)
@@ -726,6 +736,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           Layout.minimumWidth: 0
           text: profileRow.profile.name
@@ -737,6 +748,7 @@ Panel {
           elide: Text.ElideRight
         }
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           Layout.minimumWidth: 0
           text: profileRow.profile.username + "@" + String(profileRow.profile.serverURL).replace(/^https?:\/\//, "")
@@ -933,6 +945,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         // Hidden (not just blank) when there's nothing to show, so the
         // RowLayout drops its width and spacing and the title lines up with
         // the artist/album rows above instead of sitting in an empty gutter.
@@ -970,6 +983,7 @@ Panel {
         spacing: Style.space(1)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           Layout.minimumWidth: 0
           text: itemRow.item ? (itemRow.item.title || itemRow.item.name || "") : ""
@@ -980,6 +994,7 @@ Panel {
           elide: Text.ElideRight
         }
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           Layout.minimumWidth: 0
           visible: text !== ""
@@ -999,6 +1014,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         visible: itemRow.kind === "song" && itemRow.item && itemRow.item.duration
         text: itemRow.item ? Model.formatDuration(itemRow.item.duration || 0) : ""
         color: root.dim
@@ -1056,6 +1072,7 @@ Panel {
         spacing: Style.space(6)
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           Layout.minimumWidth: 0
           text: npBar.song ? npBar.song.title : ""
@@ -1076,6 +1093,7 @@ Panel {
           implicitHeight: formatPillText.implicitHeight + Style.space(3)
 
           Text {
+            textFormat: Text.PlainText
             id: formatPillText
             anchors.centerIn: parent
             text: formatPill.formatLabel
@@ -1086,6 +1104,7 @@ Panel {
         }
       }
       Text {
+        textFormat: Text.PlainText
         Layout.fillWidth: true
         text: npBar.song ? npBar.song.artist : ""
         color: root.dim
@@ -1099,6 +1118,7 @@ Panel {
         spacing: Style.space(6)
 
         Text {
+          textFormat: Text.PlainText
           text: Model.formatDuration(nav.position)
           color: root.dim
           font.family: root.fontFamily
@@ -1117,6 +1137,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: Model.formatRemaining(nav.position, nav.duration)
           color: root.dim
           font.family: root.fontFamily

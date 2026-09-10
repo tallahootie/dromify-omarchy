@@ -28,6 +28,14 @@ Item {
   readonly property string apiBin: pluginDir + "/bin/dromify-api"
   readonly property string playerBin: pluginDir + "/bin/dromify-player"
 
+  // dromify-api already caps what it will buffer from the server, but the
+  // response comes back through a StdioCollector that would hold it a second
+  // time in this (the bar's) process. Reject anything past this ceiling
+  // before it reaches JSON.parse, so a regression or a hostile server can't
+  // balloon the shell's memory. Matches dromify-api's own MAX_JSON_BYTES.
+  readonly property int _maxApiBytes: 16 * 1024 * 1024
+  function _overSized(s) { return s && s.length > _maxApiBytes }
+
   property bool configured: false
   property string lastError: ""
   property bool connecting: false
@@ -848,6 +856,12 @@ Item {
       root._apiBusy = false
       if (exitCode === 0) {
         var data = null
+        if (root._overSized(apiOut.text)) {
+          root.lastError = "server response too large"
+          if (cb) cb(null, root.lastError)
+          Qt.callLater(root._drainApiQueue)
+          return
+        }
         try { data = JSON.parse(apiOut.text) } catch (e) { /* leave null */ }
         if (cb) cb(data, "")
       } else {
@@ -995,6 +1009,10 @@ Item {
     stderr: StdioCollector { id: loadErr; waitForEnd: true }
     onExited: function(exitCode) {
       var cb = loadProcess._cb; loadProcess._cb = null
+      if (exitCode === 0 && root._overSized(loadOut.text)) {
+        if (cb) cb("", "stream URL list too large")
+        return
+      }
       if (cb) cb(exitCode === 0 ? loadOut.text : "", exitCode === 0 ? "" : String(loadErr.text || "").trim())
     }
   }

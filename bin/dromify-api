@@ -42,6 +42,21 @@ SECRET_SERVICE="omarchy-dromify"
 CLIENT_NAME="Dromify"
 API_VERSION="1.16.1"
 
+# The server on the other end is not trusted to bound what it sends back: a
+# hostile or compromised server could stream an unbounded body and balloon
+# this process (and the QML side that reads our stdout) out of memory, or
+# fill the cache partition. Everything we buffer or download is capped.
+MAX_JSON_BYTES=$((16 * 1024 * 1024))    # API responses buffered in-shell
+MAX_COVER_BYTES=$((16 * 1024 * 1024))   # cover-art downloads (to disk)
+MAX_CONFIG_BYTES=$((1024 * 1024))       # our own config.json when we read it
+
+# The only hosts we will talk to over plain http://: the loopback literals,
+# i.e. a server on this same machine, where there is no wire to listen on.
+# Anywhere else the replayable Subsonic salt+token would cross a network in
+# the clear, so it must be https:// (see the README for getting a cert on a
+# home server via `tailscale serve`).
+LOOPBACK_HOSTS=" localhost 127.0.0.1 ::1 [::1] "
+
 # The plugin used to be called "Dromarchy" (before it took the Dromify
 # name to match the iOS app) - these are where its config/keyring entries
 # lived, so a rename doesn't force everyone to reconfigure their server.
@@ -71,6 +86,29 @@ read_secret_stdin() {
   printf '%s' "$s"
 }
 
+url_scheme() { local s="${1%%://*}"; printf '%s' "${s,,}"; }
+
+url_host() {
+  local r="${1#*://}"           # drop scheme
+  r="${r%%/*}"; r="${r##*@}"    # drop /path?query and user:pass@
+  case "$r" in
+    \[*\]*) r="${r%%\]*}]" ;;   # [ipv6]:port -> [ipv6]
+    *:*)    r="${r%%:*}"   ;;   # host:port    -> host
+  esac
+  printf '%s' "${r,,}"
+}
+
+# False if the URL would put the replayable salt+token on a cleartext wire.
+# https:// always passes; http:// passes only to a loopback literal (a server
+# on this same machine). Everything else must be https://.
+require_secure_url() {
+  local scheme host
+  scheme=$(url_scheme "$1"); host=$(url_host "$1")
+  [[ "$scheme" == https ]] && return 0
+  [[ "$scheme" == http && "$LOOPBACK_HOSTS" == *" $host "* ]] && return 0
+  return 1
+}
+
 # curl against a fully-authenticated URL without putting it in argv. Every
 # request URL carries the Subsonic salt+token (`t`, `s`) — a replayable
 # credential — and /proc/<pid>/cmdline is world-readable, so the URL is fed
@@ -78,14 +116,48 @@ read_secret_stdin() {
 # (--max-time, -o ...) still go on the command line as "$@". A legit authed
 # URL is whitespace/quote/control-char free (jq's @uri encodes the lot);
 # anything else is rejected so it can't break out of the config value.
+# $2 is a hard ceiling (bytes) on the response, passed to --max-filesize.
 curl_auth() {
-  local url="$1"; shift
+  local url="$1" max="$2"; shift 2
   case $url in
     *[[:space:]]* | *[[:cntrl:]]* | *'"'*) fail "refusing to request a malformed URL" ;;
   esac
-  curl -fsS -K - "$@" <<CURLCFG
+  require_secure_url "$url" \
+    || fail "insecure server URL: $(url_scheme "$url")://$(url_host "$url") -- must be https:// (plain http:// only for a server on this same machine); see README"
+
+  # Lock curl to the base scheme and refuse redirects. We never pass -L, so no
+  # redirect is followed and curl's effective URL is always the one below;
+  # --max-redirs 0 / --proto-redir make that explicit and downgrade-proof if
+  # -L is ever added later.
+  local proto=https
+  [[ "$(url_scheme "$url")" == http ]] && proto=http
+
+  curl -fsS -K - \
+    --proto "=$proto" --proto-redir "=$proto" --max-redirs 0 \
+    --max-filesize "$max" \
+    "$@" <<CURLCFG
 url = "$url"
 CURLCFG
+}
+
+# curl_auth for a JSON API call, with a hard stop on how much we buffer:
+# --max-filesize aborts up front on an oversized declared Content-Length;
+# the `head -c` stop covers a chunked / length-less response. Prints the body
+# on stdout; returns non-zero (and a message on stderr) on transport failure
+# or an over-limit body.
+curl_json() {
+  local url="$1"; shift
+  local body rc
+  body=$(curl_auth "$url" "$MAX_JSON_BYTES" "$@" | head -c "$((MAX_JSON_BYTES + 1))"; exit "${PIPESTATUS[0]}")
+  rc=$?
+  if (( rc == 23 || rc == 141 )); then
+    echo "server response exceeded $MAX_JSON_BYTES bytes" >&2; return 1
+  fi
+  (( rc == 0 )) || return "$rc"
+  if (( $(printf '%s' "$body" | wc -c) > MAX_JSON_BYTES )); then
+    echo "server response exceeded $MAX_JSON_BYTES bytes" >&2; return 1
+  fi
+  printf '%s' "$body"
 }
 
 # --- config storage ----------------------------------------------------------
@@ -100,8 +172,9 @@ migrate_from_dromarchy() {
   [[ -f "$OLD_CONFIG_FILE" ]] || return 0
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
-  cp "$OLD_CONFIG_FILE" "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
+  [[ -L "$OLD_CONFIG_FILE" ]] && fail "$OLD_CONFIG_FILE is a symlink; refusing to migrate it"
+  [[ -L "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is a symlink; refusing to write through it"
+  read_small_file "$OLD_CONFIG_FILE" | write_config || fail "could not migrate $OLD_CONFIG_FILE"
 
   local p id name server username password
   while IFS= read -r p; do
@@ -114,7 +187,7 @@ migrate_from_dromarchy() {
     secret-tool store --label="Dromify: $name ($username@$server)" \
       service "$SECRET_SERVICE" profile "$id" <<<"$password" 2>/dev/null
     secret-tool clear service "$OLD_SECRET_SERVICE" profile "$id" >/dev/null 2>&1
-  done < <(jq -c '(.profiles // [])[]' <<<"$(cat "$CONFIG_FILE")" 2>/dev/null)
+  done < <(jq -c '(.profiles // [])[]' <<<"$(read_small_file "$CONFIG_FILE")" 2>/dev/null)
 }
 
 # One-time upgrade from the pre-multi-profile config shape
@@ -125,7 +198,7 @@ migrate_from_dromarchy() {
 migrate_legacy_config() {
   [[ -f "$CONFIG_FILE" ]] || return 0
   local raw has_profiles legacy_url legacy_user
-  raw=$(cat "$CONFIG_FILE")
+  raw=$(read_small_file "$CONFIG_FILE") || return 0
   has_profiles=$(jq -r 'has("profiles")' <<<"$raw" 2>/dev/null)
   [[ "$has_profiles" == "true" ]] && return 0
   legacy_url=$(jq -r '.serverURL // empty' <<<"$raw" 2>/dev/null)
@@ -145,21 +218,43 @@ migrate_legacy_config() {
   secret-tool clear service "$SECRET_SERVICE" server "$legacy_url" username "$legacy_user" >/dev/null 2>&1
 }
 
+# cat a file we expect to be small: refuse a symlink / non-regular target and
+# anything implausibly large, so a planted symlink can't redirect the read and
+# a huge or corrupt file can't be slurped into unbounded memory. Returns 1 if
+# the file is simply absent.
+read_small_file() {
+  local f="$1" max="${2:-$MAX_CONFIG_BYTES}" sz
+  [[ -e "$f" || -L "$f" ]] || return 1
+  [[ -L "$f" ]] && fail "$f is a symlink; refusing to read through it"
+  [[ -f "$f" ]] || fail "$f is not a regular file"
+  sz=$(wc -c < "$f") || fail "cannot stat $f"
+  (( sz <= max )) || fail "$f is implausibly large ($sz bytes); refusing to parse"
+  cat "$f"
+}
+
 # Prints the raw config JSON, or "{}" if there's no config file yet (a fresh
 # install, or one that's had every profile forgotten).
 read_config() {
   migrate_from_dromarchy
   migrate_legacy_config
-  [[ -f "$CONFIG_FILE" ]] && cat "$CONFIG_FILE" || echo '{}'
+  read_small_file "$CONFIG_FILE" || echo '{}'
 }
 
 write_config() {
-  # $1 = new config JSON on stdin
+  # new config JSON on stdin -> atomic, symlink-safe replace of $CONFIG_FILE.
+  # The temp file is created with a randomized name in the same directory
+  # (mktemp: O_CREAT|O_EXCL, mode 0600) so it can't be pre-planted as a
+  # symlink, and the rename is atomic on the same filesystem.
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
-  cat > "$CONFIG_FILE.tmp"
-  mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
+  [[ -L "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is a symlink; refusing to write through it"
+  [[ -e "$CONFIG_FILE" && ! -f "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is not a regular file"
+  local tmp
+  tmp=$(mktemp "$CONFIG_DIR/.config.json.XXXXXX") || fail "could not create a temp file in $CONFIG_DIR"
+  [[ -L "$tmp" ]] && { rm -f "$tmp"; fail "temp file replaced under us; aborting"; }
+  chmod 600 "$tmp"
+  cat > "$tmp"               || { rm -f "$tmp"; fail "could not stage new config"; }
+  mv -f "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; fail "could not replace $CONFIG_FILE"; }
 }
 
 # Loads the active profile's credentials into SERVER_URL/USERNAME/PASSWORD.
@@ -226,7 +321,7 @@ verify_credentials() {
   salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
   token=$(printf '%s' "${password}${salt}" | md5sum | cut -d' ' -f1)
   url="${server}/rest/ping.view?u=$(urlencode "$username")&t=${token}&s=${salt}&v=${API_VERSION}&c=${CLIENT_NAME}&f=json"
-  body=$(curl_auth "$url" --max-time 10) || { echo "could not reach $server" >&2; return 1; }
+  body=$(curl_json "$url" --max-time 10) || { echo "could not reach $server" >&2; return 1; }
   status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
   if [[ "$status" != "ok" ]]; then
     printf '%s' "$body" | jq -r '.["subsonic-response"].error.message // "authentication failed"' >&2
@@ -242,6 +337,7 @@ cmd_configure() {
     || fail "usage: configure <name> <serverURL> <username>   (password on stdin)"
   [[ "$server" =~ ^https?:// ]] || fail "server URL must start with http:// or https://"
   server=$(normalize_url "$server")
+  require_secure_url "$server" || fail "server URL must be https:// (plain http:// is allowed only for a server on this same machine) -- see README for getting a cert on a home server"
 
   local err
   err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
@@ -331,6 +427,7 @@ cmd_relogin() {
   server=$(jq -r '.serverURL' <<<"$profile")
   username=$(jq -r '.username' <<<"$profile")
   name=$(jq -r '.name' <<<"$profile")
+  require_secure_url "$server" || fail "profile server URL is insecure ($server); reconfigure it as https:// -- see README"
 
   local err
   err=$(verify_credentials "$server" "$username" "$password" 2>&1) || fail "$err"
@@ -352,6 +449,8 @@ cmd_relogin() {
 build_url() {
   local endpoint="$1"; shift
   require_active_profile
+  require_secure_url "$SERVER_URL" \
+    || fail "profile server URL is insecure ($SERVER_URL); reconfigure it as https:// -- see README"
   local salt token qs kv k v
   salt=$(head -c 16 /dev/urandom | md5sum | cut -c1-16)
   token=$(printf '%s' "${PASSWORD}${salt}" | md5sum | cut -d' ' -f1)
@@ -388,7 +487,7 @@ cmd_get() {
   [[ -n "$endpoint" ]] || fail "usage: get <endpoint> [key=value ...]"
   local url body status
   url=$(build_url "$endpoint" "$@") || exit 1
-  body=$(curl_auth "$url" --max-time 15) || fail "request to $endpoint failed"
+  body=$(curl_json "$url" --max-time 15) || fail "request to $endpoint failed"
   status=$(printf '%s' "$body" | jq -r '.["subsonic-response"].status // empty')
   if [[ "$status" != "ok" ]]; then
     local msg
@@ -435,15 +534,31 @@ cmd_copy_password() {
 cmd_cover() {
   local id="$1" size="${2:-300}"
   [[ -n "$id" ]] || fail "usage: cover <coverArtId> [size]"
+  # $size ends up in the cache filename below; keep it a bare integer so it
+  # can't add a path component.
+  [[ "$size" =~ ^[0-9]+$ ]] || fail "cover size must be a positive integer"
   local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/dromify/covers"
   mkdir -p "$cache_dir"
+  chmod 700 "$cache_dir"
   local safe_id
   safe_id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')
   local path="$cache_dir/${safe_id}-${size}.jpg"
-  if [[ ! -s "$path" ]]; then
-    local url
+  [[ -L "$path" ]] && rm -f "$path"
+  if [[ ! -s "$path" || ! -f "$path" ]]; then
+    local url tmp n
     url=$(build_url "getCoverArt.view" "id=$id" "size=$size") || exit 1
-    curl_auth "$url" --max-time 15 -o "$path.tmp" && mv "$path.tmp" "$path" || { rm -f "$path.tmp"; fail "could not fetch cover art"; }
+    # randomized same-dir temp (mktemp: O_EXCL, 0600) so it can't be a
+    # pre-planted symlink; --max-filesize plus the post-download size check
+    # bound a hostile server's response; atomic rename into place.
+    tmp=$(mktemp "$cache_dir/.cover.XXXXXX") || fail "could not create a temp file in $cache_dir"
+    [[ -L "$tmp" ]] && { rm -f "$tmp"; fail "temp file replaced under us; aborting"; }
+    if curl_auth "$url" "$MAX_COVER_BYTES" --max-time 15 -o "$tmp"; then
+      n=$(wc -c < "$tmp")
+      (( n <= MAX_COVER_BYTES )) || { rm -f "$tmp"; fail "cover art exceeded $MAX_COVER_BYTES bytes"; }
+      mv -f "$tmp" "$path" || { rm -f "$tmp"; fail "could not store cover art"; }
+    else
+      rm -f "$tmp"; fail "could not fetch cover art"
+    fi
   fi
   printf '%s' "$path"
 }
