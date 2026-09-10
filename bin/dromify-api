@@ -70,7 +70,15 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found
 need jq
 need curl
 need md5sum
-need python3   # read_small_file() needs a single O_NOFOLLOW|O_NONBLOCK open
+need python3   # runs the bundled dromify-fsafe helper (see fsafe() below)
+
+# Every read/write/mkdir in our config + cache tree goes through this bundled
+# helper, which traverses each path component with openat(O_NOFOLLOW) so a
+# symlink swapped into a parent directory can't redirect the operation. It
+# sits next to this script; resolve its directory even when we're on PATH.
+FSAFE="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/dromify-fsafe"
+[[ -f "$FSAFE" ]] || fail "bundled helper not found: $FSAFE"
+fsafe() { python3 "$FSAFE" "$@"; }
 
 urlencode() { jq -rn --arg v "${1:-}" '$v|@uri'; }
 
@@ -163,23 +171,6 @@ curl_json() {
 
 # --- config storage ----------------------------------------------------------
 
-# Fail if any path component of $1 below $2 (a base we assume is ours) is a
-# symlink. Run before mkdir -p / chmod / write so a link planted at
-# ~/.config/omarchy (or .../omarchy/dromify) can't redirect those into, or
-# change the mode of, a directory outside our own tree.
-assert_no_symlink_below() {
-  local target="$1" base="$2" p seg rest
-  [[ "$target" == "$base/"* ]] || return 0
-  rest="${target#"$base"/}"
-  p="$base"
-  local IFS=/
-  for seg in $rest; do
-    [[ -n "$seg" ]] || continue
-    p="$p/$seg"
-    [[ -L "$p" ]] && fail "$p is a symlink; refusing to write through it"
-  done
-}
-
 # One-time move from the old "Dromarchy"-branded config dir/keyring service
 # to today's "Dromify" ones (see OLD_CONFIG_FILE/OLD_SECRET_SERVICE above).
 # Copies config.json over as-is and re-stores each profile's password under
@@ -188,12 +179,12 @@ assert_no_symlink_below() {
 migrate_from_dromarchy() {
   [[ -f "$CONFIG_FILE" ]] && return 0
   [[ -f "$OLD_CONFIG_FILE" ]] || return 0
-  assert_no_symlink_below "$CONFIG_DIR" "${XDG_CONFIG_HOME:-$HOME/.config}"
-  mkdir -p "$CONFIG_DIR"
-  chmod 700 "$CONFIG_DIR"
-  [[ -L "$OLD_CONFIG_FILE" ]] && fail "$OLD_CONFIG_FILE is a symlink; refusing to migrate it"
-  [[ -L "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is a symlink; refusing to write through it"
-  read_small_file "$OLD_CONFIG_FILE" | write_config || fail "could not migrate $OLD_CONFIG_FILE"
+  # Read the old file fully before writing anything (read_small_file / fsafe
+  # reject a symlinked path outright), so a rejected read can't leave a
+  # half-written new config behind.
+  local old_raw
+  old_raw=$(read_small_file "$OLD_CONFIG_FILE") || fail "could not read $OLD_CONFIG_FILE for migration"
+  printf '%s' "$old_raw" | write_config || fail "could not migrate $OLD_CONFIG_FILE"
 
   local p id name server username password
   while IFS= read -r p; do
@@ -237,64 +228,18 @@ migrate_legacy_config() {
   secret-tool clear service "$SECRET_SERVICE" server "$legacy_url" username "$legacy_user" >/dev/null 2>&1
 }
 
-# Print a file we expect to be small. The earlier version did separate
-# pathname checks, then `wc -c`, then `cat` -- three opens the target could be
-# swapped between, so `cat` could still follow a freshly planted symlink/FIFO
-# or stream a file that grew after the size check. This opens the path exactly
-# once, with O_NOFOLLOW|O_NONBLOCK (so a symlink final component fails outright
-# and a FIFO can't block us), then validates type / owner / link count / size
-# on that same descriptor and reads at most max+1 bytes from it -- so nothing
-# about the file can change under us between the check and the read. Parent
-# components are refused if they are symlinks. Returns 1 if the file is simply
-# absent.
+# Print a file from our config tree, with no TOCTOU window anywhere in the
+# path: fsafe walks every component from the XDG base with openat(O_NOFOLLOW)
+# -- so a symlink swapped into a parent between check and use can't redirect
+# the read -- opens the file itself O_NOFOLLOW|O_NONBLOCK, validates
+# type/owner/link-count/size on that fd, and emits at most max+1 bytes from
+# it. Returns 1 (not fatal) when the file is simply absent; a rejection is
+# fatal, matching the old behaviour.
 read_small_file() {
-  local f="$1" max="${2:-$MAX_CONFIG_BYTES}" rc
-  assert_no_symlink_below "$f" "${XDG_CONFIG_HOME:-$HOME/.config}"
-  python3 - "$f" "$max" <<'PY'
-import errno, os, stat, sys
-
-path, max_bytes = sys.argv[1], int(sys.argv[2])
-
-def die(msg):
-    sys.stderr.write("dromify-api: %s\n" % msg)
-    raise SystemExit(1)
-
-try:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-except FileNotFoundError:
-    raise SystemExit(3)          # simply absent -> caller falls back to '{}'
-except IsADirectoryError:
-    die("%s is a directory; refusing to read it" % path)
-except OSError as e:
-    if e.errno == errno.ELOOP:
-        die("%s is a symlink; refusing to read through it" % path)
-    die("cannot open %s: %s" % (path, e.strerror or e))
-
-try:
-    st = os.fstat(fd)
-    if not stat.S_ISREG(st.st_mode):
-        die("%s is not a regular file; refusing to read it" % path)
-    if st.st_uid != os.geteuid():
-        die("%s is not owned by this user; refusing to read it" % path)
-    if st.st_nlink != 1:
-        die("%s has %d hard links; refusing to read it" % (path, st.st_nlink))
-    if st.st_size > max_bytes:
-        die("%s is implausibly large (%d bytes); refusing to parse" % (path, st.st_size))
-
-    data = b""
-    while len(data) <= max_bytes:
-        chunk = os.read(fd, max_bytes + 1 - len(data))
-        if not chunk:
-            break
-        data += chunk
-finally:
-    os.close(fd)
-
-if len(data) > max_bytes:
-    die("%s is implausibly large (> %d bytes); refusing to parse" % (path, max_bytes))
-
-os.write(1, data)
-PY
+  local f="$1" max="${2:-$MAX_CONFIG_BYTES}" base rc
+  base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  [[ "$f" == "$base"/* ]] || fail "read_small_file: $f is not under $base"
+  fsafe read "$base" "${f#"$base"/}" "$max"
   rc=$?
   (( rc == 0 )) && return 0
   (( rc == 3 )) && return 1
@@ -310,21 +255,17 @@ read_config() {
 }
 
 write_config() {
-  # new config JSON on stdin -> atomic, symlink-safe replace of $CONFIG_FILE.
-  # The temp file is created with a randomized name in the same directory
-  # (mktemp: O_CREAT|O_EXCL, mode 0600) so it can't be pre-planted as a
-  # symlink, and the rename is atomic on the same filesystem.
-  assert_no_symlink_below "$CONFIG_DIR" "${XDG_CONFIG_HOME:-$HOME/.config}"
-  mkdir -p "$CONFIG_DIR"
-  chmod 700 "$CONFIG_DIR"
-  [[ -L "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is a symlink; refusing to write through it"
-  [[ -e "$CONFIG_FILE" && ! -f "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is not a regular file"
-  local tmp
-  tmp=$(mktemp "$CONFIG_DIR/.config.json.XXXXXX") || fail "could not create a temp file in $CONFIG_DIR"
-  [[ -L "$tmp" ]] && { rm -f "$tmp"; fail "temp file replaced under us; aborting"; }
-  chmod 600 "$tmp"
-  cat > "$tmp"               || { rm -f "$tmp"; fail "could not stage new config"; }
-  mv -f "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; fail "could not replace $CONFIG_FILE"; }
+  # new config JSON on stdin -> atomic replace of $CONFIG_FILE. fsafe walks
+  # every component from the XDG base with openat(O_NOFOLLOW), creating a
+  # missing dir 0700 and re-opening it O_NOFOLLOW (so a dir race-planted as a
+  # symlink is still caught), forces the leaf dir to 0700, then writes an
+  # O_CREAT|O_EXCL|O_NOFOLLOW temp in that dir and renameat()s it into place
+  # -- replacing a regular file or a planted symlink atomically, never
+  # following it.
+  local base="${XDG_CONFIG_HOME:-$HOME/.config}"
+  [[ "$CONFIG_FILE" == "$base"/* ]] || fail "write_config: $CONFIG_FILE is not under $base"
+  fsafe write "$base" "${CONFIG_FILE#"$base"/}" "$MAX_CONFIG_BYTES" \
+    || fail "could not write $CONFIG_FILE"
 }
 
 # Loads the active profile's credentials into SERVER_URL/USERNAME/PASSWORD.
@@ -607,29 +548,23 @@ cmd_cover() {
   # $size ends up in the cache filename below; keep it a bare integer so it
   # can't add a path component.
   [[ "$size" =~ ^[0-9]+$ ]] || fail "cover size must be a positive integer"
-  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/dromify/covers"
-  assert_no_symlink_below "$cache_dir" "${XDG_CACHE_HOME:-$HOME/.cache}"
-  mkdir -p "$cache_dir"
-  chmod 700 "$cache_dir"
+  local cache_base="${XDG_CACHE_HOME:-$HOME/.cache}"
   local safe_id
   safe_id=$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')
-  local path="$cache_dir/${safe_id}-${size}.jpg"
-  [[ -L "$path" ]] && rm -f "$path"
-  if [[ ! -s "$path" || ! -f "$path" ]]; then
-    local url tmp n
+  local rel="dromify/covers/${safe_id}-${size}.jpg"
+  local path="$cache_base/$rel"
+  # fsafe stat resolves the cache path with openat(O_NOFOLLOW) too, so a
+  # symlinked cache dir/entry reads as "absent" and we just re-fetch.
+  if ! fsafe stat "$cache_base" "$rel"; then
+    local url
     url=$(build_url "getCoverArt.view" "id=$id" "size=$size") || exit 1
-    # randomized same-dir temp (mktemp: O_EXCL, 0600) so it can't be a
-    # pre-planted symlink; --max-filesize plus the post-download size check
-    # bound a hostile server's response; atomic rename into place.
-    tmp=$(mktemp "$cache_dir/.cover.XXXXXX") || fail "could not create a temp file in $cache_dir"
-    [[ -L "$tmp" ]] && { rm -f "$tmp"; fail "temp file replaced under us; aborting"; }
-    if curl_auth "$url" "$MAX_COVER_BYTES" --max-time 15 -o "$tmp"; then
-      n=$(wc -c < "$tmp")
-      (( n <= MAX_COVER_BYTES )) || { rm -f "$tmp"; fail "cover art exceeded $MAX_COVER_BYTES bytes"; }
-      mv -f "$tmp" "$path" || { rm -f "$tmp"; fail "could not store cover art"; }
-    else
-      rm -f "$tmp"; fail "could not fetch cover art"
-    fi
+    # curl streams the body to stdout (no -o path for a hostile server to aim
+    # at); --max-filesize caps a declared Content-Length and `fsafe write`
+    # caps the actual bytes, then writes an O_CREAT|O_EXCL|O_NOFOLLOW temp in
+    # the openat-verified cache dir and renameat()s it into place.
+    curl_auth "$url" "$MAX_COVER_BYTES" --max-time 15 \
+      | fsafe write "$cache_base" "$rel" "$MAX_COVER_BYTES" \
+      || fail "could not fetch cover art"
   fi
   printf '%s' "$path"
 }

@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+# dromify-fsafe - the one path through which dromify-api touches its config
+# and cache tree (~/.config/omarchy/dromify, ~/.cache/dromify).
+#
+# It opens the trusted base directory once, then walks every remaining path
+# component with openat(O_NOFOLLOW) against the held directory fd. A symlink
+# swapped into a parent directory (say ~/.config/omarchy) between a check and
+# its use therefore cannot redirect the read, the write, the mkdir or the
+# chmod onto a target outside the tree: there is no second path resolution to
+# race. The final file open is O_NOFOLLOW|O_NONBLOCK and is validated
+# (regular file, owned by us, one link, size) on its own fd; writes go to an
+# O_CREAT|O_EXCL|O_NOFOLLOW temp in the verified parent dir and are
+# renameat()-ed into place (renameat over a regular file or a planted symlink
+# replaces that entry itself and never follows it).
+#
+# Usage (relpath is always resolved under base, never absolute, no "..")
+#   dromify-fsafe read  <base> <relpath> <maxbytes>
+#       file contents -> stdout. Exit 3 if the file (or a parent) is absent.
+#   dromify-fsafe stat  <base> <relpath>
+#       Exit 0 if relpath is a non-empty regular file we own, else exit 3.
+#   dromify-fsafe write <base> <relpath> <maxbytes>
+#       stdin (at most maxbytes) -> relpath, atomically. Parent directories
+#       are created 0700 as needed and the leaf directory is forced to 0700.
+
+import errno
+import os
+import stat
+import sys
+
+ABSENT = 3
+
+
+def die(msg):
+    sys.stderr.write("dromify-fsafe: %s\n" % msg)
+    raise SystemExit(1)
+
+
+def split_rel(rel):
+    if rel.startswith("/"):
+        die("refusing an absolute path: %s" % rel)
+    parts = [p for p in rel.split("/") if p and p != "."]
+    if not parts or ".." in parts:
+        die("refusing a suspicious path: %s" % rel)
+    return parts[:-1], parts[-1]
+
+
+def open_base(base, create=False):
+    try:
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if not create:
+            raise SystemExit(ABSENT)
+        os.makedirs(base, 0o700, exist_ok=True)
+        fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    if os.fstat(fd).st_uid != os.geteuid():
+        os.close(fd)
+        die("%s is not owned by this user" % base)
+    return fd
+
+
+def walk_dirs(base_fd, parts, create=False, chmod_last=False):
+    """Open each component of `parts` as a directory relative to the previous
+    one, never following a symlink. Returns the fd of the last directory
+    (which is base_fd when `parts` is empty)."""
+    cur = base_fd
+    for i, name in enumerate(parts):
+        nxt = None
+        for last_try in (False, True):
+            try:
+                nxt = os.open(
+                    name,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC,
+                    dir_fd=cur,
+                )
+                break
+            except FileNotFoundError:
+                if cur is not base_fd and (not create or last_try):
+                    os.close(cur)
+                if not create:
+                    raise SystemExit(ABSENT)
+                if last_try:
+                    die("could not create directory %s" % name)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=cur)
+                except FileExistsError:
+                    pass
+            except OSError as e:
+                # O_NOFOLLOW|O_DIRECTORY on a symlink gives ENOTDIR on Linux,
+                # not ELOOP; lstat the component (still under the held fd) to
+                # report which it was. Either way the open refused to follow.
+                note = None
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    try:
+                        note = ("is a symlink"
+                                if stat.S_ISLNK(os.lstat(name, dir_fd=cur).st_mode)
+                                else "is not a directory")
+                    except OSError:
+                        note = "is not a directory"
+                if cur is not base_fd:
+                    os.close(cur)
+                if note:
+                    die("%s %s; refusing to traverse it" % (name, note))
+                die("cannot open %s: %s" % (name, e.strerror or e))
+        if os.fstat(nxt).st_uid != os.geteuid():
+            os.close(nxt)
+            if cur is not base_fd:
+                os.close(cur)
+            die("%s is not owned by this user" % name)
+        if chmod_last and i == len(parts) - 1:
+            os.fchmod(nxt, 0o700)
+        if cur is not base_fd:
+            os.close(cur)
+        cur = nxt
+    return cur
+
+
+def read_file(parent_fd, leaf, rel, max_bytes):
+    try:
+        fd = os.open(
+            leaf,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+    except FileNotFoundError:
+        raise SystemExit(ABSENT)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            die("%s is a symlink; refusing to read through it" % rel)
+        if e.errno == errno.EISDIR:
+            die("%s is a directory; refusing to read it" % rel)
+        die("cannot open %s: %s" % (rel, e.strerror or e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            die("%s is not a regular file; refusing to read it" % rel)
+        if st.st_uid != os.geteuid():
+            die("%s is not owned by this user; refusing to read it" % rel)
+        if st.st_nlink != 1:
+            die("%s has %d hard links; refusing to read it" % (rel, st.st_nlink))
+        if st.st_size > max_bytes:
+            die("%s is implausibly large (%d bytes); refusing to parse" % (rel, st.st_size))
+        data = b""
+        while len(data) <= max_bytes:
+            chunk = os.read(fd, max_bytes + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        die("%s is implausibly large (> %d bytes); refusing to parse" % (rel, max_bytes))
+    os.write(1, data)
+
+
+def write_file(parent_fd, leaf, rel, data):
+    try:
+        if stat.S_ISDIR(os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False).st_mode):
+            die("%s is a directory; refusing to replace it" % rel)
+    except FileNotFoundError:
+        pass
+    tmp = ".%s.%s.tmp" % (leaf, os.urandom(8).hex())
+    tfd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        off = 0
+        while off < len(data):
+            off += os.write(tfd, data[off:])
+        os.fsync(tfd)
+    finally:
+        os.close(tfd)
+    try:
+        os.rename(tmp, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+    except OSError as e:
+        try:
+            os.unlink(tmp, dir_fd=parent_fd)
+        except OSError:
+            pass
+        die("could not replace %s: %s" % (rel, e.strerror or e))
+
+
+def main(argv):
+    if len(argv) < 4:
+        die("usage: dromify-fsafe read|stat|write <base> <relpath> [maxbytes]")
+    cmd, base = argv[1], argv[2]
+    parent_parts, leaf = split_rel(argv[3])
+
+    if cmd == "read":
+        base_fd = open_base(base)
+        try:
+            parent_fd = walk_dirs(base_fd, parent_parts)
+            try:
+                read_file(parent_fd, leaf, argv[3], int(argv[4]))
+            finally:
+                if parent_fd != base_fd:
+                    os.close(parent_fd)
+        finally:
+            os.close(base_fd)
+
+    elif cmd == "stat":
+        base_fd = open_base(base)
+        try:
+            parent_fd = walk_dirs(base_fd, parent_parts)
+            try:
+                try:
+                    st = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    raise SystemExit(ABSENT)
+                ok = (
+                    stat.S_ISREG(st.st_mode)
+                    and st.st_size > 0
+                    and st.st_uid == os.geteuid()
+                )
+                raise SystemExit(0 if ok else ABSENT)
+            finally:
+                if parent_fd != base_fd:
+                    os.close(parent_fd)
+        finally:
+            os.close(base_fd)
+
+    elif cmd == "write":
+        max_bytes = int(argv[4])
+        data = sys.stdin.buffer.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            die("refusing to write %s: input exceeds %d bytes" % (argv[3], max_bytes))
+        if not data:
+            # No caller writes an empty file; an empty body means the producer
+            # (a failed curl, an aborted jq) fell over -- don't publish it.
+            die("refusing to write %s: empty input" % argv[3])
+        base_fd = open_base(base, create=True)
+        try:
+            parent_fd = walk_dirs(base_fd, parent_parts, create=True, chmod_last=True)
+            try:
+                write_file(parent_fd, leaf, argv[3], data)
+            finally:
+                if parent_fd != base_fd:
+                    os.close(parent_fd)
+        finally:
+            os.close(base_fd)
+
+    else:
+        die("unknown subcommand: %s" % cmd)
+
+
+main(sys.argv)
