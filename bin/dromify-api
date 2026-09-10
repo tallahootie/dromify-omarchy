@@ -70,6 +70,7 @@ need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found
 need jq
 need curl
 need md5sum
+need python3   # read_small_file() needs a single O_NOFOLLOW|O_NONBLOCK open
 
 urlencode() { jq -rn --arg v "${1:-}" '$v|@uri'; }
 
@@ -162,6 +163,23 @@ curl_json() {
 
 # --- config storage ----------------------------------------------------------
 
+# Fail if any path component of $1 below $2 (a base we assume is ours) is a
+# symlink. Run before mkdir -p / chmod / write so a link planted at
+# ~/.config/omarchy (or .../omarchy/dromify) can't redirect those into, or
+# change the mode of, a directory outside our own tree.
+assert_no_symlink_below() {
+  local target="$1" base="$2" p seg rest
+  [[ "$target" == "$base/"* ]] || return 0
+  rest="${target#"$base"/}"
+  p="$base"
+  local IFS=/
+  for seg in $rest; do
+    [[ -n "$seg" ]] || continue
+    p="$p/$seg"
+    [[ -L "$p" ]] && fail "$p is a symlink; refusing to write through it"
+  done
+}
+
 # One-time move from the old "Dromarchy"-branded config dir/keyring service
 # to today's "Dromify" ones (see OLD_CONFIG_FILE/OLD_SECRET_SERVICE above).
 # Copies config.json over as-is and re-stores each profile's password under
@@ -170,6 +188,7 @@ curl_json() {
 migrate_from_dromarchy() {
   [[ -f "$CONFIG_FILE" ]] && return 0
   [[ -f "$OLD_CONFIG_FILE" ]] || return 0
+  assert_no_symlink_below "$CONFIG_DIR" "${XDG_CONFIG_HOME:-$HOME/.config}"
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
   [[ -L "$OLD_CONFIG_FILE" ]] && fail "$OLD_CONFIG_FILE is a symlink; refusing to migrate it"
@@ -218,18 +237,68 @@ migrate_legacy_config() {
   secret-tool clear service "$SECRET_SERVICE" server "$legacy_url" username "$legacy_user" >/dev/null 2>&1
 }
 
-# cat a file we expect to be small: refuse a symlink / non-regular target and
-# anything implausibly large, so a planted symlink can't redirect the read and
-# a huge or corrupt file can't be slurped into unbounded memory. Returns 1 if
-# the file is simply absent.
+# Print a file we expect to be small. The earlier version did separate
+# pathname checks, then `wc -c`, then `cat` -- three opens the target could be
+# swapped between, so `cat` could still follow a freshly planted symlink/FIFO
+# or stream a file that grew after the size check. This opens the path exactly
+# once, with O_NOFOLLOW|O_NONBLOCK (so a symlink final component fails outright
+# and a FIFO can't block us), then validates type / owner / link count / size
+# on that same descriptor and reads at most max+1 bytes from it -- so nothing
+# about the file can change under us between the check and the read. Parent
+# components are refused if they are symlinks. Returns 1 if the file is simply
+# absent.
 read_small_file() {
-  local f="$1" max="${2:-$MAX_CONFIG_BYTES}" sz
-  [[ -e "$f" || -L "$f" ]] || return 1
-  [[ -L "$f" ]] && fail "$f is a symlink; refusing to read through it"
-  [[ -f "$f" ]] || fail "$f is not a regular file"
-  sz=$(wc -c < "$f") || fail "cannot stat $f"
-  (( sz <= max )) || fail "$f is implausibly large ($sz bytes); refusing to parse"
-  cat "$f"
+  local f="$1" max="${2:-$MAX_CONFIG_BYTES}" rc
+  assert_no_symlink_below "$f" "${XDG_CONFIG_HOME:-$HOME/.config}"
+  python3 - "$f" "$max" <<'PY'
+import errno, os, stat, sys
+
+path, max_bytes = sys.argv[1], int(sys.argv[2])
+
+def die(msg):
+    sys.stderr.write("dromify-api: %s\n" % msg)
+    raise SystemExit(1)
+
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except FileNotFoundError:
+    raise SystemExit(3)          # simply absent -> caller falls back to '{}'
+except IsADirectoryError:
+    die("%s is a directory; refusing to read it" % path)
+except OSError as e:
+    if e.errno == errno.ELOOP:
+        die("%s is a symlink; refusing to read through it" % path)
+    die("cannot open %s: %s" % (path, e.strerror or e))
+
+try:
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        die("%s is not a regular file; refusing to read it" % path)
+    if st.st_uid != os.geteuid():
+        die("%s is not owned by this user; refusing to read it" % path)
+    if st.st_nlink != 1:
+        die("%s has %d hard links; refusing to read it" % (path, st.st_nlink))
+    if st.st_size > max_bytes:
+        die("%s is implausibly large (%d bytes); refusing to parse" % (path, st.st_size))
+
+    data = b""
+    while len(data) <= max_bytes:
+        chunk = os.read(fd, max_bytes + 1 - len(data))
+        if not chunk:
+            break
+        data += chunk
+finally:
+    os.close(fd)
+
+if len(data) > max_bytes:
+    die("%s is implausibly large (> %d bytes); refusing to parse" % (path, max_bytes))
+
+os.write(1, data)
+PY
+  rc=$?
+  (( rc == 0 )) && return 0
+  (( rc == 3 )) && return 1
+  exit "$rc"
 }
 
 # Prints the raw config JSON, or "{}" if there's no config file yet (a fresh
@@ -245,6 +314,7 @@ write_config() {
   # The temp file is created with a randomized name in the same directory
   # (mktemp: O_CREAT|O_EXCL, mode 0600) so it can't be pre-planted as a
   # symlink, and the rename is atomic on the same filesystem.
+  assert_no_symlink_below "$CONFIG_DIR" "${XDG_CONFIG_HOME:-$HOME/.config}"
   mkdir -p "$CONFIG_DIR"
   chmod 700 "$CONFIG_DIR"
   [[ -L "$CONFIG_FILE" ]] && fail "$CONFIG_FILE is a symlink; refusing to write through it"
@@ -538,6 +608,7 @@ cmd_cover() {
   # can't add a path component.
   [[ "$size" =~ ^[0-9]+$ ]] || fail "cover size must be a positive integer"
   local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/dromify/covers"
+  assert_no_symlink_below "$cache_dir" "${XDG_CACHE_HOME:-$HOME/.cache}"
   mkdir -p "$cache_dir"
   chmod 700 "$cache_dir"
   local safe_id
