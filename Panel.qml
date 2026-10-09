@@ -38,7 +38,10 @@ Panel {
   // shared one shows up, at which point every binding here re-evaluates
   // and switches over on its own.
   readonly property var nav: (bar && bar.shell && bar.shell.firstPartyServiceFor("tallahootie.dromify")) || _localNav
-  Service { id: _localNav }
+  Service {
+    id: _localNav
+    restoreOnStartup: root.nav === _localNav
+  }
 
   // --- per-instance keyboard focus / scroll ---------------------------------
   // Everything about *what* is being browsed (tabs, drill-down, search,
@@ -1199,7 +1202,7 @@ Panel {
           tooltipText: nav.shuffleEnabled ? "Shuffle: on" : "Shuffle: off"
           foreground: nav.shuffleEnabled ? Color.accent : root.foreground
           fontFamily: root.fontFamily
-          enabled: nav.queueIndex >= 0
+          enabled: nav.queueMetadataAvailable && nav.queueIndex >= 0
           onClicked: nav.toggleShuffle()
         }
         PanelActionButton {
@@ -1214,6 +1217,7 @@ Panel {
           tooltipText: "Favourite"
           foreground: (npBar.song && npBar.song.starred) ? Color.accent : root.foreground
           fontFamily: root.fontFamily
+          enabled: !!(npBar.song && npBar.song.id)
           onClicked: nav.toggleFavorite(npBar.song)
         }
       }

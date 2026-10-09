@@ -40,6 +40,9 @@ Omarchy theme, not the app's.
 - Passwords live in the desktop keyring (`secret-tool` / libsecret), not in
   a config file; the password and the authenticated stream URLs are passed
   between the helpers over stdin, never on the command line
+- Playback recovery restores repeat mode from `mpv` and stores queue/shuffle
+  metadata in `~/.local/state/dromify/queue.json`; stream URLs and tokens
+  are excluded
 - The server name in the header links to its web UI; each settings row has
   a copy-password button for the first sign-in there
 
@@ -149,6 +152,20 @@ echo demo | bin/dromify-api configure Demo https://demo.navidrome.org demo
 bin/dromify-api get getRandomSongs.view size=5
 bin/dromify-player status
 ```
+
+## Tests
+
+Run the helper-state test with `tests/queue-state.sh`. The live shell-reload
+integration test restarts Omarchy shell and requires unpaused Dromify playback.
+Run it explicitly:
+
+```bash
+DROMIFY_RUN_SHELL_RELOAD_TEST=1 tests/shell-reload-integration.sh
+```
+
+It checks that the same `mpv` process survives, now-playing metadata matches
+the saved queue position (allowing playback to advance across multiple tracks),
+and Dromify restores repeat/shuffle state without logging track metadata.
 
 ## Licence
 

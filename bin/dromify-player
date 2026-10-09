@@ -37,6 +37,9 @@
 #   dromify-player volume <0-100>
 #   dromify-player set-repeat <off|all|one> # off, loop-playlist, or loop-file
 #   dromify-player status                   -> JSON transport snapshot
+#   dromify-player save-queue-state          # read song metadata JSON from stdin
+#   dromify-player queue-state               -> saved song metadata JSON
+#   dromify-player clear-queue-state
 #   dromify-player quit                     # fully stop the mpv instance
 
 set -uo pipefail
@@ -60,8 +63,11 @@ else
     || fail "$RUNTIME_DIR is not a directory this user owns"
 fi
 SOCK="$RUNTIME_DIR/dromify-mpv.sock"
-LOG="${XDG_STATE_HOME:-$HOME/.local/state}/dromify/mpv.log"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dromify"
+LOG="$STATE_DIR/mpv.log"
+QUEUE_STATE="$STATE_DIR/queue.json"
 LOCK="$RUNTIME_DIR/dromify-mpv.lock"
+readonly MAX_QUEUE_STATE_SONGS=2000
 MPRIS_SO_CANDIDATES=(/usr/lib/mpv-mpris/mpris.so /etc/mpv/scripts/mpris.so)
 
 need() { command -v "$1" >/dev/null 2>&1 || fail "'$1' is required but not found on PATH"; }
@@ -88,9 +94,7 @@ is_running() {
 # error line can't expose a Subsonic token to other local users, and refuse
 # to append through a planted symlink that could redirect the writes.
 harden_log() {
-  local dir; dir="$(dirname "$LOG")"
-  mkdir -p "$dir"
-  chmod 700 "$dir" 2>/dev/null || true
+  ensure_state_dir
   [[ -L "$LOG" ]] && rm -f "$LOG"
   : >>"$LOG" 2>/dev/null || true
   chmod 600 "$LOG" 2>/dev/null || true
@@ -304,7 +308,7 @@ cmd_set_repeat() {
 
 cmd_status() {
   if ! is_running; then
-    echo '{"running":false,"paused":true,"position":0,"duration":0,"idle":true,"eof":false,"volume":100,"path":"","playlistPos":-1,"playlistCount":0,"audioCodec":"","audioBitrate":0}'
+    echo '{"running":false,"paused":true,"position":0,"duration":0,"idle":true,"eof":false,"volume":100,"playlistPos":-1,"playlistCount":0,"audioCodec":"","audioBitrate":0,"mediaTitle":"","artist":"","repeatMode":"off"}'
     return 0
   fi
   local req reply
@@ -315,11 +319,14 @@ cmd_status() {
     '{"command":["get_property","idle-active"]}' \
     '{"command":["get_property","eof-reached"]}' \
     '{"command":["get_property","volume"]}' \
-    '{"command":["get_property","path"]}' \
     '{"command":["get_property","playlist-pos"]}' \
     '{"command":["get_property","playlist-count"]}' \
     '{"command":["get_property","audio-codec-name"]}' \
-    '{"command":["get_property","audio-bitrate"]}')
+    '{"command":["get_property","audio-bitrate"]}' \
+    '{"command":["get_property","media-title"]}' \
+    '{"command":["get_property","metadata/by-key/artist"]}' \
+    '{"command":["get_property","loop-playlist"]}' \
+    '{"command":["get_property","loop-file"]}')
   reply=$(ipc_send "$req")
   # Note: deliberately not using jq's `//` here — it treats a JSON `false`
   # as absent (same as null), which would silently turn a real "not paused"
@@ -327,6 +334,8 @@ cmd_status() {
   # actual null.
   jq -cs '
     def orDefault(d): if . == null then d else . end;
+    def safeText: if type != "string" then "" elif (ascii_downcase | contains("://")) then "" else .[0:512] end;
+    def loopEnabled: . == "inf" or (type == "number" and . > 0);
     {
       running: true,
       paused:   (.[0].data | orDefault(true)),
@@ -335,12 +344,112 @@ cmd_status() {
       idle:     (.[3].data | orDefault(true)),
       eof:      (.[4].data | orDefault(false)),
       volume:   (.[5].data | orDefault(100)),
-      path:     (.[6].data | orDefault("")),
-      playlistPos:   (.[7].data | orDefault(-1)),
-      playlistCount: (.[8].data | orDefault(0)),
-      audioCodec:    (.[9].data | orDefault("")),
-      audioBitrate:  (.[10].data | orDefault(0) | if type == "number" then . else 0 end)
+      playlistPos:   (.[6].data | orDefault(-1)),
+      playlistCount: (.[7].data | orDefault(0)),
+      audioCodec:    (.[8].data | orDefault("")),
+      audioBitrate:  (.[9].data | orDefault(0) | if type == "number" then . else 0 end),
+      mediaTitle:    (.[10].data | orDefault("") | safeText),
+      artist:        (.[11].data | orDefault("") | safeText),
+      repeatMode:    (if (.[13].data | loopEnabled) then "one" elif (.[12].data | loopEnabled) then "all" else "off" end)
     }' <<<"$reply"
+}
+
+ensure_state_dir() {
+  mkdir -p -- "$STATE_DIR" || fail "cannot create $STATE_DIR"
+  [[ -d "$STATE_DIR" && -O "$STATE_DIR" ]] || fail "$STATE_DIR is not a directory this user owns"
+  if [[ -L "$STATE_DIR" ]]; then
+    local mode
+    mode=$(stat -Lc '%a' -- "$STATE_DIR") || fail "cannot inspect $STATE_DIR symlink target"
+    [[ "$mode" =~ ^[0-7]+$ ]] || fail "cannot read $STATE_DIR symlink target permissions"
+    (( (8#$mode & 0022) == 0 )) || fail "$STATE_DIR symlink target is group- or world-writable"
+  else
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+  fi
+}
+
+cmd_save_queue_state() {
+  local raw safe tmp
+  IFS= read -r raw || [[ -n "$raw" ]] || fail "queue state is empty"
+  safe=$(jq -ce --argjson max "$MAX_QUEUE_STATE_SONGS" '
+    def text($limit): if type == "string" then .[0:$limit] else "" end;
+    def number: if type == "number" and . >= 0 and . <= 100000000 then . else 0 end;
+    def entries:
+      if type != "array" or length > $max then error("invalid queue")
+      else map(
+        if type != "object" then error("invalid queue entry") else {
+          id:       (.id | text(256)),
+          title:    (.title | text(256)),
+          artist:   (.artist | text(256)),
+          album:    (.album | text(256)),
+          coverArt: (.coverArt | text(256)),
+          duration: (.duration | number),
+          starred:  (.starred == true)
+        } end
+      ) end;
+    (if type == "array" then
+      {queue: entries, shuffleEnabled: false, unshuffledQueue: []}
+    elif type == "object" and (.queue | type) == "array" then
+      {
+        queue: (.queue | entries),
+        shuffleEnabled: (.shuffleEnabled == true),
+        unshuffledQueue: (if .shuffleEnabled == true then (.unshuffledQueue | entries) else [] end)
+      }
+    else error("invalid queue") end)
+    | if .shuffleEnabled and (
+        (.queue | length) != (.unshuffledQueue | length)
+        or (.queue | map(.id) | sort) != (.unshuffledQueue | map(.id) | sort)
+      ) then error("invalid shuffle state") else . end' <<<"$raw") || fail "invalid queue state"
+  ensure_state_dir
+  umask 077
+  tmp=$(mktemp "$STATE_DIR/queue.XXXXXX") || fail "cannot create queue state"
+  if ! printf '%s\n' "$safe" > "$tmp" || ! chmod 600 "$tmp"; then
+    rm -f -- "$tmp"
+    fail "cannot write queue state"
+  fi
+  if ! mv -f -- "$tmp" "$QUEUE_STATE"; then
+    rm -f -- "$tmp"
+    fail "cannot replace queue state"
+  fi
+  echo '{"ok":true}'
+}
+
+cmd_queue_state() {
+  ensure_state_dir
+  if [[ ! -e "$QUEUE_STATE" ]]; then
+    echo '{"queue":[],"shuffleEnabled":false,"unshuffledQueue":[]}'
+    return 0
+  fi
+  [[ ! -L "$QUEUE_STATE" && -f "$QUEUE_STATE" && -O "$QUEUE_STATE" ]] \
+    || fail "queue state is not a regular file this user owns"
+  jq -ce '
+    def validShuffle:
+      .shuffleEnabled == true
+      and (.unshuffledQueue | type) == "array"
+      and (.queue | length) == (.unshuffledQueue | length)
+      and (.queue | map(.id) | sort) == (.unshuffledQueue | map(.id) | sort);
+    if type == "object" and (.queue | type) == "array" then
+      . as $state | {
+        queue: $state.queue,
+        shuffleEnabled: ($state | validShuffle),
+        unshuffledQueue: (if ($state | validShuffle) then $state.unshuffledQueue else [] end)
+      }
+    else error("invalid queue state") end' "$QUEUE_STATE" \
+    || fail "invalid queue state"
+}
+
+cmd_clear_queue_state() {
+  ensure_state_dir
+  [[ ! -L "$QUEUE_STATE" ]] || fail "queue state is a symlink"
+  rm -f -- "$QUEUE_STATE" || fail "cannot clear queue state"
+  echo '{"ok":true}'
+}
+
+cmd_restore() {
+  local status snapshot
+  status=$(cmd_status) || return 1
+  snapshot=$(cmd_queue_state) || snapshot='{"queue":[],"shuffleEnabled":false,"unshuffledQueue":[]}'
+  jq -cn --argjson status "$status" --argjson snapshot "$snapshot" \
+    '{status: $status, queue: $snapshot.queue, shuffleEnabled: $snapshot.shuffleEnabled, unshuffledQueue: $snapshot.unshuffledQueue}'
 }
 
 cmd_stop() {
@@ -371,9 +480,13 @@ main() {
     volume) cmd_volume "${1:-100}" ;;
     set-repeat) cmd_set_repeat "${1:-}" ;;
     status) cmd_status ;;
+    save-queue-state) cmd_save_queue_state ;;
+    queue-state) cmd_queue_state ;;
+    clear-queue-state) cmd_clear_queue_state ;;
+    restore) cmd_restore ;;
     stop) cmd_stop ;;
     quit) cmd_quit ;;
-    *) fail "unknown command '$cmd' (expected: ensure|load-queue|reorder-tail|next|previous|pause|resume|toggle-pause|seek|volume|set-repeat|status|stop|quit)" ;;
+    *) fail "unknown command '$cmd' (expected: ensure|load-queue|reorder-tail|next|previous|pause|resume|toggle-pause|seek|volume|set-repeat|status|save-queue-state|queue-state|clear-queue-state|restore|stop|quit)" ;;
   esac
 }
 

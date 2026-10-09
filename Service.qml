@@ -37,6 +37,7 @@ Item {
   function _overSized(s) { return s && s.length > _maxApiBytes }
 
   property bool configured: false
+  property bool restoreOnStartup: true
   property string lastError: ""
   property bool connecting: false
 
@@ -52,11 +53,20 @@ Item {
   property string audioCodec: ""
   property int audioBitrate: 0   // bits/sec, 0 if unknown
 
-  // The play queue is whatever list the user played from (an album, a
-  // playlist, search results, ...); queueIndex is the position within it.
+  // When metadata is available, queue mirrors the list the user played
+  // (album, playlist, search results, ...). After an older session reloads
+  // without a saved snapshot, mpv still owns the playlist; fallbackCurrentSong
+  // carries the current title/artist until the user starts a new queue.
   property var queue: []
   property int queueIndex: -1
-  readonly property var currentSong: (queueIndex >= 0 && queueIndex < queue.length) ? queue[queueIndex] : null
+  property bool queueMetadataAvailable: false
+  property var fallbackCurrentSong: null
+  property int fallbackPlaylistCount: 0
+  property var _pendingQueueState: null
+  readonly property var currentSong: queueMetadataAvailable
+    ? ((queueIndex >= 0 && queueIndex < queue.length) ? queue[queueIndex] : null)
+    : fallbackCurrentSong
+  onRestoreOnStartupChanged: if (!restoreOnStartup) pollTimer.stop()
   // True from the moment a track is requested until mpv confirms it loaded.
   // playFrom refuses to start a second load while one is in flight, so
   // spamming next/prev can't race two loads and leave `queue`/`queueIndex`
@@ -76,7 +86,7 @@ Item {
   // match (see _reorderTail). Only the *upcoming* portion (after
   // queueIndex) is shuffled — history and the currently playing entry stay
   // put — and _unshuffledQueue keeps the pre-shuffle order so toggling
-  // back off restores it exactly rather than reshuffling again.
+  // back off restores remaining tracks in original order.
   property bool shuffleEnabled: false
   property var _unshuffledQueue: null
 
@@ -537,6 +547,8 @@ Item {
     searchResults = { artists: patch(searchResults.artists), albums: patch(searchResults.albums), songs: patch(searchResults.songs) }
     if (topFrame) replaceTopFrame(topFrame.kind, topFrame.id, topFrame.title, patch(topFrame.items))
     queue = patch(queue)
+    if (_unshuffledQueue) _unshuffledQueue = patch(_unshuffledQueue)
+    if (queueMetadataAvailable) _saveQueueState(queue)
   }
 
   // --- cover art -----------------------------------------------------------
@@ -585,6 +597,11 @@ Item {
   // just ignored with no feedback.
   property int _playGen: 0
 
+  function _discardPendingPlaybackRuns() {
+    loadProcess._pending = null
+    playQueueProcess._pending = null
+  }
+
   // Interleaves urls with each song's title label for dromify-player
   // load-queue, which bakes each one in as that playlist entry's own
   // force-media-title — see the long comment on cmd_load_queue for why
@@ -596,7 +613,7 @@ Item {
   // Builds the stdin payload for dromify-player load-queue / reorder-tail:
   // url and title on their own lines, one pair per track. The stream URLs
   // carry the Subsonic salt+token, so they go over stdin, never argv (see
-  // _runWithSecret). Titles are forced onto a single line — they're only a
+  // _runLatest). Titles are forced onto a single line — they're only a
   // cosmetic force-media-title, and a newline would desync the pairing.
   function _queuePayload(songs, urls) {
     var lines = []
@@ -606,6 +623,116 @@ Item {
       lines.push(String(title).replace(/[\r\n]+/g, " "))
     }
     return lines.join("\n")
+  }
+
+  // Persist only queue metadata; authenticated stream URLs never enter the state file.
+  function _queueMetadata(songs) {
+    return songs.map(function(song) {
+      return {
+        id: String(song.id || ""),
+        title: String(song.title || ""),
+        artist: String(song.artist || ""),
+        album: String(song.album || ""),
+        coverArt: String(song.coverArt || ""),
+        duration: Number(song.duration) || 0,
+        starred: !!song.starred
+      }
+    })
+  }
+
+  function _queueStatePayload(songs) {
+    var saveShuffle = shuffleEnabled && Array.isArray(_unshuffledQueue)
+    return JSON.stringify({
+      queue: _queueMetadata(songs),
+      shuffleEnabled: saveShuffle,
+      unshuffledQueue: saveShuffle ? _queueMetadata(_unshuffledQueue) : []
+    })
+  }
+
+  function _sameQueueIds(first, second) {
+    if (!Array.isArray(first) || !Array.isArray(second) || first.length !== second.length) return false
+    var counts = ({})
+    for (var i = 0; i < first.length; i++) {
+      var firstId = first[i] ? first[i].id : ""
+      if (typeof firstId !== "string" || firstId === "") return false
+      var firstKey = "$" + firstId
+      counts[firstKey] = (counts[firstKey] || 0) + 1
+    }
+    for (var j = 0; j < second.length; j++) {
+      var secondId = second[j] ? second[j].id : ""
+      if (typeof secondId !== "string" || secondId === "") return false
+      var secondKey = "$" + secondId
+      if (!counts[secondKey]) return false
+      counts[secondKey]--
+    }
+    return true
+  }
+
+  function _saveQueueState(songs) {
+    _pendingQueueState = { operation: "save", payload: _queueStatePayload(songs) }
+    _flushQueueState()
+  }
+
+  function _clearQueueState() {
+    _pendingQueueState = { operation: "clear", payload: "" }
+    _flushQueueState()
+  }
+
+  function _flushQueueState() {
+    if (queueStateProcess.running || !_pendingQueueState) return
+    var next = _pendingQueueState
+    _pendingQueueState = null
+    queueStateProcess._operation = next.operation
+    queueStateProcess._input = next.payload
+    queueStateProcess.command = [playerBin, next.operation === "clear" ? "clear-queue-state" : "save-queue-state"]
+    queueStateProcess.running = true
+  }
+
+  function _safeStatusText(value) {
+    return String(value || "").replace(/[\r\n]+/g, " ").slice(0, 512)
+  }
+
+  function restorePlayback() {
+    var gen = _playGen
+    _run(restoreProcess, [playerBin, "restore"], function(snapshot) {
+      if (!restoreOnStartup || gen !== _playGen || !snapshot || !snapshot.status) return
+      var status = snapshot.status
+      repeatMode = status.repeatMode === "one" || status.repeatMode === "all" ? status.repeatMode : "off"
+      shuffleEnabled = false
+      _unshuffledQueue = null
+      var pos = Math.floor(Number(status.playlistPos))
+      var count = Math.floor(Number(status.playlistCount))
+      if (status.running !== true || status.idle === true || !isFinite(pos) || !isFinite(count) || pos < 0 || count < 1 || pos >= count) return
+
+      var savedQueue = Array.isArray(snapshot.queue) ? snapshot.queue : []
+      queueMetadataAvailable = savedQueue.length === count && savedQueue.every(function(song) {
+        return song && typeof song.id === "string" && song.id !== ""
+      })
+      var savedUnshuffledQueue = Array.isArray(snapshot.unshuffledQueue) ? snapshot.unshuffledQueue : []
+      var restoreShuffle = queueMetadataAvailable && snapshot.shuffleEnabled === true
+        && _sameQueueIds(savedQueue, savedUnshuffledQueue)
+      shuffleEnabled = restoreShuffle
+      _unshuffledQueue = restoreShuffle ? savedUnshuffledQueue : null
+      fallbackPlaylistCount = count
+      queue = queueMetadataAvailable ? savedQueue : []
+      fallbackCurrentSong = queueMetadataAvailable ? null : {
+        id: "",
+        title: _safeStatusText(status.mediaTitle),
+        artist: _safeStatusText(status.artist)
+      }
+      queueIndex = pos
+      position = Number(status.position) || 0
+      duration = Number(status.duration) || 0
+      var restoredVolume = Number(status.volume)
+      volume = isFinite(restoredVolume) ? Math.round(restoredVolume) : 100
+      audioCodec = status.audioCodec || ""
+      audioBitrate = Number(status.audioBitrate) || 0
+      paused = status.paused === true
+      playing = status.running === true && !paused
+      if (currentSong && (currentSong.title || currentSong.artist))
+        console.info("dromify: restored now playing state repeat=" + repeatMode + " shuffle=" + shuffleEnabled)
+      pollTimer.start()
+    })
   }
 
   // Plays `songs[startIndex]`, queuing the rest of `songs` behind it as the
@@ -618,26 +745,31 @@ Item {
     // no longer refers to anything real.
     shuffleEnabled = false
     _unshuffledQueue = null
+    _discardPendingPlaybackRuns()
     var gen = ++_playGen
     loading = true
+    queueMetadataAvailable = true
+    fallbackCurrentSong = null
+    fallbackPlaylistCount = 0
     queue = songs
     queueIndex = startIndex
     var ids = songs.map(function(s) { return s.id })
-    _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
+    _runLatest(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
-      _runWithSecret(playQueueProcess,
-                     [playerBin, "load-queue", String(startIndex), String(urls.length)],
-                     _queuePayload(songs, urls),
-                     function() {
+      _runLatest(playQueueProcess,
+                 [playerBin, "load-queue", String(startIndex), String(urls.length)],
+                 function(ok) {
         if (gen !== _playGen) return
         loading = false
+        if (ok === false) { lastError = "player could not load queue"; return }
         paused = false
         playing = true
+        _saveQueueState(queue)
         pollTimer.restart()
-      })
+      }, _queuePayload(songs, urls))
       _apiGet(["scrobble.view", "id=" + songs[startIndex].id, "submission=false"], function() {})
     })
   }
@@ -653,12 +785,12 @@ Item {
   // that. Nothing here needs to relabel the title — every entry already
   // carries its own correct one, baked in when the queue was loaded.
   function next() {
-    if (queue.length === 0) return
+    if (queueMetadataAvailable ? queue.length === 0 : fallbackPlaylistCount < 2) return
     _run(playerCtlProcess, [playerBin, "next"], function() { pollNow() })
   }
 
   function previous() {
-    if (queue.length === 0) return
+    if (queueMetadataAvailable ? queue.length === 0 : fallbackPlaylistCount < 2) return
     _run(playerCtlProcess, [playerBin, "previous"], function() { pollNow() })
   }
 
@@ -668,8 +800,7 @@ Item {
   }
 
   function toggleShuffle() {
-    if (queueIndex < 0 || queue.length === 0) return
-    var currentSong = queue[queueIndex]
+    if (!queueMetadataAvailable || queueIndex < 0 || queue.length === 0) return
     var newQueue, newIndex
 
     if (!shuffleEnabled) {
@@ -685,13 +816,24 @@ Item {
       newIndex = queueIndex
       shuffleEnabled = true
     } else {
-      // queueIndex is a position in the *shuffled* queue, not the restored
-      // one — find the currently-playing song by id rather than reusing it.
-      newQueue = _unshuffledQueue || queue
-      newIndex = 0
+      // Keep the played prefix in its actual order. mpv only lets us replace
+      // the playlist tail, so the current song must stay at queueIndex.
+      newQueue = queue.slice(0, queueIndex + 1)
+      var playedIds = ({})
       for (var k = 0; k < newQueue.length; k++) {
-        if (newQueue[k].id === currentSong.id) { newIndex = k; break }
+        var playedKey = "$" + String(newQueue[k].id || "")
+        playedIds[playedKey] = (playedIds[playedKey] || 0) + 1
       }
+      var originalQueue = _unshuffledQueue || queue
+      var upcoming = []
+      for (var m = 0; m < originalQueue.length; m++) {
+        var originalSong = originalQueue[m]
+        var originalKey = "$" + String(originalSong.id || "")
+        if (playedIds[originalKey]) playedIds[originalKey]--
+        else upcoming.push(originalSong)
+      }
+      newQueue = newQueue.concat(upcoming)
+      newIndex = queueIndex
       _unshuffledQueue = null
       shuffleEnabled = false
     }
@@ -709,25 +851,38 @@ Item {
   // has after its own current position and appends the new tail fresh, so
   // mpv never issues a loadfile for the entry it's already playing.
   function _reorderTail(newQueue, newIndex) {
+    _discardPendingPlaybackRuns()
     var gen = ++_playGen
+    queueMetadataAvailable = true
+    fallbackCurrentSong = null
+    fallbackPlaylistCount = 0
     queue = newQueue
     queueIndex = newIndex
     var tail = newQueue.slice(newIndex + 1)
-    if (tail.length === 0) return
     loading = true
+    if (tail.length === 0) {
+      _runLatest(playQueueProcess, [playerBin, "reorder-tail", "0"], function(ok) {
+        if (gen !== _playGen) return
+        loading = false
+        if (ok === false) { lastError = "player could not update queue"; return }
+        _saveQueueState(queue)
+      }, "")
+      return
+    }
     var ids = tail.map(function(s) { return s.id })
-    _run(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
+    _runLatest(loadProcess, [apiBin, "urls", "stream.view"].concat(ids), function(urlsOut, err) {
       if (gen !== _playGen) return
       if (err || !urlsOut) { lastError = err || "could not build stream URLs"; loading = false; return }
       var urls = String(urlsOut).split("\n").map(function(u) { return u.trim() }).filter(function(u) { return u !== "" })
       if (urls.length === 0) { lastError = "could not build stream URLs"; loading = false; return }
-      _runWithSecret(playQueueProcess,
-                     [playerBin, "reorder-tail", String(urls.length)],
-                     _queuePayload(tail, urls),
-                     function() {
+      _runLatest(playQueueProcess,
+                 [playerBin, "reorder-tail", String(urls.length)],
+                 function(ok) {
         if (gen !== _playGen) return
         loading = false
-      })
+        if (ok === false) { lastError = "player could not update queue"; return }
+        _saveQueueState(queue)
+      }, _queuePayload(tail, urls))
     })
   }
 
@@ -743,14 +898,23 @@ Item {
   }
 
   function stopPlayback() {
+    _discardPendingPlaybackRuns()
+    ++_playGen
+    loading = false
     pollTimer.stop()
     queue = []
     queueIndex = -1
+    queueMetadataAvailable = false
+    fallbackCurrentSong = null
+    fallbackPlaylistCount = 0
+    shuffleEnabled = false
+    _unshuffledQueue = null
+    _clearQueueState()
     playing = false
     paused = true
     position = 0
     duration = 0
-    _run(playerCtlProcess, [playerBin, "stop"], function() {})
+    _runLatest(playQueueProcess, [playerBin, "stop"], function() {}, "")
   }
 
   function pollNow() {
@@ -807,20 +971,44 @@ Item {
       if (data.volume !== undefined) root.volume = Math.round(Number(data.volume))
       root.audioCodec = data.audioCodec || ""
       root.audioBitrate = Number(data.audioBitrate) || 0
+      if (data.repeatMode === "off" || data.repeatMode === "all" || data.repeatMode === "one")
+        root.repeatMode = data.repeatMode
+
+      if (data.running !== true || data.idle === true) {
+        root.queue = []
+        root.queueIndex = -1
+        root.queueMetadataAvailable = false
+        root.fallbackCurrentSong = null
+        root.fallbackPlaylistCount = 0
+        root.shuffleEnabled = false
+        root._unshuffledQueue = null
+        root._clearQueueState()
+        pollTimer.stop()
+        return
+      }
 
       // mpv's playlist-pos is the one source of truth for "what's playing" —
       // it moves the same way whether the track changed because of an
-      // in-app button, a media key, `playerctl`, or mpv just finishing a
-      // track and auto-advancing on its own. Whenever it moves, follow it
-      // and scrobble the track that just finished / announce the new one as
-      // "now playing" — no need to relabel mpv's title here too, since
-      // every entry already carries its own correct one from load-queue.
+      // in-app button, a media key, `playerctl`, or mpv auto-advancing. With
+      // a metadata-backed queue, follow it and scrobble each track; without
+      // one, refresh only the current title/artist from mpv.
       var pos = data.playlistPos !== undefined ? Number(data.playlistPos) : -1
-      if (pos >= 0 && pos !== root.queueIndex && pos < root.queue.length) {
+      if (!root.queueMetadataAvailable && pos >= 0) {
+        var count = Math.floor(Number(data.playlistCount))
+        if (count > 0) root.fallbackPlaylistCount = count
+        if (pos < root.fallbackPlaylistCount) {
+          root.queueIndex = pos
+          var priorSong = root.fallbackCurrentSong || {}
+          var title = root._safeStatusText(data.mediaTitle)
+          var artist = root._safeStatusText(data.artist)
+          if (priorSong.title !== title || priorSong.artist !== artist)
+            root.fallbackCurrentSong = { id: "", title: title, artist: artist }
+        }
+      } else if (root.queueMetadataAvailable && pos >= 0 && pos !== root.queueIndex && pos < root.queue.length) {
         var finishedSong = root.currentSong
         root.queueIndex = pos
-        if (finishedSong) _apiGet(["scrobble.view", "id=" + finishedSong.id, "submission=true"], function() {})
-        if (root.currentSong) _apiGet(["scrobble.view", "id=" + root.currentSong.id, "submission=false"], function() {})
+        if (finishedSong && finishedSong.id) _apiGet(["scrobble.view", "id=" + finishedSong.id, "submission=true"], function() {})
+        if (root.currentSong && root.currentSong.id) _apiGet(["scrobble.view", "id=" + root.currentSong.id, "submission=false"], function() {})
       }
     }
   }
@@ -922,12 +1110,9 @@ Item {
     return true
   }
 
-  // Like _run, but stashes a payload for the Process to write to the child's
-  // stdin from its onStarted handler, keeping it out of argv (world-readable
-  // via /proc/<pid>/cmdline). Used for the server password (dromify-api
-  // configure/relogin) and for the stream-URL queue (dromify-player
-  // load-queue/reorder-tail) — those URLs carry the Subsonic salt+token,
-  // which is a replayable credential.
+  // Like _run, but keeps the server password off argv (world-readable via
+  // /proc/<pid>/cmdline). Playback URLs use _runLatest, which applies same
+  // stdin handling while also serializing newer requests.
   function _runWithSecret(proc, command, secret, callback) {
     if (proc.running) return false
     proc._cb = callback
@@ -935,6 +1120,33 @@ Item {
     proc.command = command
     proc.running = true
     return true
+  }
+
+  // Playback requests are latest-wins: while one subprocess runs, retain
+  // newest request and start it as soon as current request exits. `secret`
+  // stays off argv and is written to stdin by the process's onStarted handler.
+  function _runLatest(proc, command, callback, secret) {
+    var request = { command: command, callback: callback, secret: secret }
+    if (proc.running || proc._pending) {
+      proc._pending = request
+      return true
+    }
+    _startLatestRun(proc, request)
+    return true
+  }
+
+  function _startLatestRun(proc, request) {
+    proc._cb = request.callback
+    if (request.secret !== undefined) proc._secret = request.secret
+    proc.command = request.command
+    proc.running = true
+  }
+
+  function _drainLatestRun(proc) {
+    if (proc.running || !proc._pending) return
+    var request = proc._pending
+    proc._pending = null
+    _startLatestRun(proc, request)
   }
 
   Process {
@@ -1004,6 +1216,7 @@ Item {
   Process {
     id: loadProcess
     property var _cb: null
+    property var _pending: null
     running: false
     stdout: StdioCollector { id: loadOut; waitForEnd: true }
     stderr: StdioCollector { id: loadErr; waitForEnd: true }
@@ -1011,9 +1224,10 @@ Item {
       var cb = loadProcess._cb; loadProcess._cb = null
       if (exitCode === 0 && root._overSized(loadOut.text)) {
         if (cb) cb("", "stream URL list too large")
-        return
+      } else if (cb) {
+        cb(exitCode === 0 ? loadOut.text : "", exitCode === 0 ? "" : String(loadErr.text || "").trim())
       }
-      if (cb) cb(exitCode === 0 ? loadOut.text : "", exitCode === 0 ? "" : String(loadErr.text || "").trim())
+      Qt.callLater(function() { root._drainLatestRun(loadProcess) })
     }
   }
 
@@ -1028,14 +1242,50 @@ Item {
     }
   }
 
+  Process {
+    id: restoreProcess
+    property var _cb: null
+    running: false
+    stdout: StdioCollector { id: restoreOut; waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onExited: function(exitCode) {
+      var cb = restoreProcess._cb; restoreProcess._cb = null
+      if (exitCode !== 0 || root._overSized(restoreOut.text)) { if (cb) cb(null); return }
+      var data = null
+      try { data = JSON.parse(restoreOut.text) } catch (e) {}
+      if (cb) cb(data)
+    }
+  }
+
+  Process {
+    id: queueStateProcess
+    property string _operation: ""
+    property string _input: ""
+    stdinEnabled: true
+    running: false
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { waitForEnd: true }
+    onStarted: {
+      if (queueStateProcess._operation === "save") queueStateProcess.write(queueStateProcess._input + "\n")
+      queueStateProcess._input = ""
+    }
+    onExited: function(exitCode) {
+      queueStateProcess._operation = ""
+      if (exitCode !== 0) console.warn("dromify: unable to persist playback queue metadata")
+      root._flushQueueState()
+    }
+  }
+
   // Separate from playerCtlProcess so a track load never contends with an
   // unrelated transport call (pause/seek/volume/next/previous) sharing the
   // same Process object and getting silently dropped by _run's busy guard.
-  // Always driven via _runWithSecret: the queue's stream URLs (which carry
-  // the Subsonic token) are written to stdin from onStarted, never argv.
+  // Driven via _runLatest: while busy, newest request replaces pending one.
+  // Queue URLs carry the Subsonic token; onStarted writes them to stdin,
+  // never argv.
   Process {
     id: playQueueProcess
     property var _cb: null
+    property var _pending: null
     property string _secret: ""
     stdinEnabled: true
     running: false
@@ -1049,7 +1299,8 @@ Item {
     onExited: function(exitCode) {
       playQueueProcess._secret = ""
       var cb = playQueueProcess._cb; playQueueProcess._cb = null
-      if (cb) cb()
+      if (cb) cb(exitCode === 0)
+      Qt.callLater(function() { root._drainLatestRun(playQueueProcess) })
     }
   }
 
@@ -1069,7 +1320,10 @@ Item {
     warmupProcess.running = true
   }
 
-  Component.onCompleted: refreshStatus(function(data) {
-    if (data && data.configured) _warmUpPlayer()
-  })
+  Component.onCompleted: {
+    refreshStatus(function(data) {
+      if (data && data.configured) _warmUpPlayer()
+    })
+    if (restoreOnStartup) restorePlayback()
+  }
 }
