@@ -19,6 +19,17 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property bool vertical: bar ? bar.vertical : false
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
+  readonly property real nowPlayingExtent: Style.space(180)
+  readonly property real nowPlayingGap: Style.space(6)
+  readonly property bool showNowPlaying: setting("showNowPlaying", false) === true
+  readonly property string nowPlayingText: {
+    var song = nav.currentSong
+    if (!song) return ""
+    var title = String(song.title || "").replace(/[\r\n]+/g, " ").slice(0, 80)
+    var artist = String(song.artist || "").replace(/[\r\n]+/g, " ").slice(0, 60)
+    return title && artist ? title + " — " + artist : title || artist
+  }
+  readonly property bool nowPlayingVisible: showNowPlaying && nowPlayingText !== ""
   // Dim by default; the bar pill lights this up to Color.accent instead
   // while something is actually playing.
   readonly property color barIconColor: Qt.darker(barForeground, 1.55)
@@ -39,6 +50,16 @@ Panel {
   // and switches over on its own.
   readonly property var nav: (bar && bar.shell && bar.shell.firstPartyServiceFor("tallahootie.dromify")) || _localNav
   Service { id: _localNav }
+
+  function setShowNowPlaying(enabled) {
+    // Apply immediately here; updateEntryInline persists the inline bar entry.
+    var entry = { id: root.moduleName }
+    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
+    entry.showNowPlaying = enabled
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
 
   // --- per-instance keyboard focus / scroll ---------------------------------
   // Everything about *what* is being browsed (tabs, drill-down, search,
@@ -120,6 +141,7 @@ Panel {
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
+  readonly property real openPanelIndicatorWidth: button.implicitWidth
 
   onOpenedChanged: if (opened) {
     nav.cursorActive = false
@@ -141,27 +163,53 @@ Panel {
   }
 
   // --- bar pill --------------------------------------------------------------
-  // Fixed-width: just the music-note icon, lit up in the accent colour while
-  // something is actually playing (dim otherwise). A track-title label was
-  // tried here but its length changes with every track, which kept
-  // reflowing every other bar widget to its right — not worth it for a
-  // pill whose panel already shows what's playing.
+  // When shown, the label reserves fixed bar-axis extent; idle state stays
+  // icon-sized.
 
   Item {
     id: button
-    implicitWidth: root.barSize
-    implicitHeight: root.barSize
+    readonly property bool tooltipHovered: root.nowPlayingVisible && nowPlayingLabel.truncated && buttonMouse.containsMouse
+    implicitWidth: root.vertical ? root.barSize
+      : root.barSize + (root.nowPlayingVisible ? root.nowPlayingGap + root.nowPlayingExtent : 0)
+    implicitHeight: root.vertical
+      ? root.barSize + (root.nowPlayingVisible ? root.nowPlayingGap + root.nowPlayingExtent : 0)
+      : root.barSize
 
     Text {
       textFormat: Text.PlainText
-      anchors.centerIn: parent
+      width: root.barSize
+      height: root.barSize
+      horizontalAlignment: Text.AlignHCenter
+      verticalAlignment: Text.AlignVCenter
       text: "󰝚"
       color: (nav.playing && !nav.paused) ? Color.accent : root.barIconColor
       font.family: root.fontFamily
       font.pixelSize: Style.font.body
     }
 
+    Text {
+      id: nowPlayingLabel
+      textFormat: Text.PlainText
+      visible: root.nowPlayingVisible
+      width: root.nowPlayingExtent
+      height: root.barSize
+      x: root.vertical ? (root.barSize - width) / 2 : root.barSize + root.nowPlayingGap
+      y: root.vertical
+        ? root.barSize + root.nowPlayingGap + (root.nowPlayingExtent - root.barSize) / 2
+        : 0
+      rotation: root.vertical ? (root.bar.position === "left" ? 270 : 90) : 0
+      verticalAlignment: Text.AlignVCenter
+      text: root.nowPlayingText
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideRight
+      maximumLineCount: 1
+      wrapMode: Text.NoWrap
+    }
+
     MouseArea {
+      id: buttonMouse
       anchors.fill: parent
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
@@ -171,6 +219,9 @@ Panel {
         else if (mouse.button === Qt.MiddleButton) nav.next()
         else root.toggle()
       }
+      onEntered: if (root.bar && button.tooltipHovered)
+        root.bar.showTooltip(button, nowPlayingLabel.text)
+      onExited: if (root.bar) root.bar.hideTooltip(button)
     }
   }
 
@@ -283,7 +334,7 @@ Panel {
 
           PanelActionButton {
             iconText: nav.showSettings ? "󰁍" : "󰒓"
-            tooltipText: nav.showSettings ? "Back to library" : "Server settings"
+            tooltipText: nav.showSettings ? "Back to library" : "Dromify settings"
             foreground: root.foreground
             fontFamily: root.fontFamily
             onClicked: nav.showSettings = !nav.showSettings
@@ -295,6 +346,24 @@ Panel {
           visible: nav.showSettings || !nav.configured
           Layout.fillWidth: true
           spacing: Style.space(10)
+
+          PanelSectionHeader {
+            text: "BAR"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            Layout.fillWidth: true
+          }
+
+          Toggle {
+            Layout.fillWidth: true
+            label: "Show now playing"
+            description: "Show current song and artist beside Dromify in the bar."
+            foreground: root.foreground
+            accent: Color.accent
+            fontFamily: root.fontFamily
+            checked: root.showNowPlaying
+            onClicked: root.setShowNowPlaying(!root.showNowPlaying)
+          }
 
           PanelSectionHeader {
             visible: nav.profiles.length > 0

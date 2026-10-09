@@ -19,6 +19,17 @@
     "description": "Search, browse, and play music from your Navidrome/Subsonic server.",
     "category": "Media",
     "allowMultiple": false,
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "defaults": {
+      "showNowPlaying": false
+    },
+    "schema": [
+      {
+        "key": "showNowPlaying",
+        "type": "boolean",
+        "label": "Show now playing",
+        "description": "Show the current song and artist in the bar."
+      }
+    ]
   }
 }
